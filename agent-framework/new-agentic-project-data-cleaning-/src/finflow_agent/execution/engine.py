@@ -1,0 +1,510 @@
+"""Execution engine for the FinFlow Agent Service.
+
+Walks a validated ``ExecutionPlan`` deterministically using a dynamically
+built LangGraph DAG. The engine enforces, on every step (acceptance criteria
+4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7, 5.1, 5.2, 10.6, 11.4):
+
+1. **Per-step Pydantic params re-validation.** Before the agent class is
+   instantiated, the engine looks up the agent's declared ``params_model``
+   class attribute and calls ``params_model.model_validate(step.params)``.
+   On :class:`pydantic.ValidationError`, the engine returns a failed
+   callback that names the offending ``step_id`` and surfaces the Pydantic
+   error message; ``agent.execute`` is never invoked. Agents that do not
+   declare a ``params_model`` (currently only ``calculation_agent``) skip
+   this check for back-compatibility, matching the validator's behavior.
+   This is defense in depth on top of the Plan_Validator's identical check.
+
+2. **Single-source ``input_dataframe``.** Only the keys named in
+   ``step.input_from`` are consulted. The first dataframe-shaped value
+   among them becomes ``input_data["input_dataframe"]``; no other state-data
+   key is ever forwarded to the agent. Two narrow, intentional exceptions:
+
+   * Upstream visualization envelopes' chart-shaped artifacts are surfaced
+     as ``input_data["chart_artifacts"]``. The visualization slot is
+     disabled by default, so this codepath is dormant in production today,
+     but keeping it preserves an existing engine-level integration test
+     (``test_engine_passes_visualization_artifacts_to_reporting``) and
+     costs nothing when no visualization step ran.
+   * For the ``reporting_agent`` only, an upstream ``column_mapping``
+     artifact (produced by the filter agent) is surfaced as
+     ``input_data["column_mapping"]`` so the audit-sheet writer can render
+     the ``column_mapping`` sheet (req 8.5).
+
+3. **Topological execution order.** Steps are executed in topological order
+   over ``depends_on``; a step never runs before all of its predecessors
+   have produced a ``success`` ``AgentResult``.
+
+4. **Stop on failed/partial.** When an agent returns ``failed`` or
+   ``partial``, the failed ``step_id`` is recorded in ``self.step_results``
+   *before* the LangGraph node raises, so the failed-step lookup at the
+   bottom is deterministic.
+
+5. **Output storage discipline.** On success, each step's envelope is
+   written to ``state.data`` under ``step.output_key`` (or ``step.step_id``
+   when ``output_key`` is ``None``). Envelopes are stored under no other
+   key.
+"""
+
+import time
+from typing import Any, Dict, List, Optional, Type
+
+import pandas as pd
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, ValidationError
+
+from finflow_agent.registry import registry
+from finflow_agent.state import AgentResult, ExecutionPlan, PipelineState
+
+
+class ExecutionEngine:
+    """Validates and executes a planned DAG deterministically."""
+
+    def __init__(self) -> None:
+        self.stages = {
+            "ingest": 1,
+            "transform": 2,
+            "analyze": 3,
+            "visualize": 4,
+            "deliver": 5,
+        }
+        self.step_results: Dict[str, Dict[str, Any]] = {}
+
+    # ------------------------------------------------------------------
+    # Topology helpers (preserved)
+    # ------------------------------------------------------------------
+    def _topological_sort(self, plan: ExecutionPlan) -> List[str]:
+        adj: Dict[str, List[str]] = {step.step_id: [] for step in plan.steps}
+        in_degree: Dict[str, int] = {step.step_id: 0 for step in plan.steps}
+
+        for step in plan.steps:
+            for dep in step.depends_on:
+                if dep not in adj:
+                    raise ValueError(f"Unknown dependency: {dep}")
+                adj[dep].append(step.step_id)
+                in_degree[step.step_id] += 1
+
+        queue = [n for n in in_degree if in_degree[n] == 0]
+        sorted_steps: List[str] = []
+
+        while queue:
+            curr = queue.pop(0)
+            sorted_steps.append(curr)
+            for neighbor in adj[curr]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+
+        if len(sorted_steps) != len(plan.steps):
+            raise ValueError("Cycle detected in ExecutionPlan")
+
+        return sorted_steps
+
+    def _validate_stages(self, plan: ExecutionPlan) -> None:
+        step_dict = {s.step_id: s for s in plan.steps}
+        for step in plan.steps:
+            agent_spec = registry.get_spec(step.agent)
+            step_stage_val = self.stages[agent_spec.stage]
+
+            for dep in step.depends_on:
+                dep_step = step_dict[dep]
+                dep_spec = registry.get_spec(dep_step.agent)
+                dep_stage_val = self.stages[dep_spec.stage]
+
+                if step_stage_val < dep_stage_val:
+                    raise ValueError(
+                        f"Stage ordering violation: {step.step_id} "
+                        f"({agent_spec.stage}) depends on {dep} "
+                        f"({dep_spec.stage})"
+                    )
+
+    # ------------------------------------------------------------------
+    # Summary builder (preserved)
+    # ------------------------------------------------------------------
+    def _build_agent_summaries(self) -> List[Dict[str, Any]]:
+        agent_summaries: List[Dict[str, Any]] = []
+        for sid, res in self.step_results.items():
+            bullets: List[str] = []
+            if res["warnings"]:
+                bullets.extend([f"Warning: {w}" for w in res["warnings"]])
+            if res["operations_applied"]:
+                bullets.extend(
+                    [f"Applied: {op.get('type')}" for op in res["operations_applied"]]
+                )
+
+            agent_summaries.append(
+                {
+                    "step_id": sid,
+                    "agent_id": sid,
+                    "agent": res["agent"],
+                    "agent_name": res["agent"].replace("_", " ").title(),
+                    "status": res["status"],
+                    "summary": res["summary"] or "Step completed successfully.",
+                    "bullets": bullets,
+                    "metrics": res["metrics"],
+                    "warnings": res["warnings"],
+                    "artifacts": res["artifacts"],
+                }
+            )
+        return agent_summaries
+
+    # ------------------------------------------------------------------
+    # Per-step input resolution (single-source contract)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_dataframe(value: Any) -> Optional[pd.DataFrame]:
+        """Return the dataframe carried by an upstream state-data value, if any.
+
+        Accepts both raw ``pd.DataFrame`` values and the engine envelope
+        shape ``{"data": <df>, "artifacts": ..., ...}``. Returns ``None``
+        for any other shape so callers can keep walking ``input_from``
+        looking for the first dataframe-shaped predecessor.
+        """
+        if isinstance(value, pd.DataFrame):
+            return value
+        if isinstance(value, dict):
+            inner = value.get("data")
+            if isinstance(inner, pd.DataFrame):
+                return inner
+        return None
+
+    @classmethod
+    def _build_input_data(
+        cls,
+        step,
+        state_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the agent ``input_data`` dict for a single step.
+
+        Walks ``step.input_from`` once. The first dataframe-shaped value
+        becomes ``input_data["input_dataframe"]``. Chart artifacts on any
+        upstream envelope are forwarded as ``input_data["chart_artifacts"]``
+        (back-compat with the visualization slot). For the ``reporting_agent``
+        only, an upstream ``column_mapping`` artifact is forwarded as
+        ``input_data["column_mapping"]`` so the audit-sheet writer can
+        render the ``column_mapping`` sheet (req 8.5). No other key from
+        ``state.data`` is ever forwarded.
+        """
+        input_data: Dict[str, Any] = {}
+        chart_artifacts: List[Dict[str, Any]] = []
+
+        for dep_key in step.input_from:
+            if dep_key not in state_data:
+                # Surface the missing key as a controlled engine error so
+                # the outer try/except can route it to a failed callback.
+                raise ValueError(
+                    f"Required input '{dep_key}' is missing in execution state."
+                )
+
+            value = state_data[dep_key]
+
+            # First dataframe-shaped value wins. Subsequent dataframes among
+            # the input_from keys are intentionally ignored: a step receives
+            # exactly one input_dataframe (req 4.3, 5.5).
+            if "input_dataframe" not in input_data:
+                df_candidate = cls._extract_dataframe(value)
+                if df_candidate is not None:
+                    input_data["input_dataframe"] = df_candidate
+
+            # Surface any chart-shaped artifacts on upstream envelopes for
+            # the reporting agent's visualization-aware codepath. Today the
+            # visualization slot is disabled by default so this branch is
+            # dormant in production, but it keeps the engine's existing
+            # integration test passing without forwarding raw envelopes.
+            if isinstance(value, dict):
+                artifacts = value.get("artifacts")
+                if isinstance(artifacts, dict):
+                    for art_value in artifacts.values():
+                        if (
+                            isinstance(art_value, dict)
+                            and "type" in art_value
+                            and "title" in art_value
+                        ):
+                            chart_artifacts.append(art_value)
+
+                    # Reporting-agent-only exception: forward the upstream
+                    # filter agent's column_mapping artifact so the audit
+                    # sheet writer can render it (req 8.5). The exception
+                    # is documented here intentionally; no other agent ever
+                    # receives state-data keys outside its input_from list.
+                    if (
+                        step.agent == "reporting_agent"
+                        and "column_mapping" not in input_data
+                    ):
+                        cm = artifacts.get("column_mapping")
+                        if cm is not None:
+                            input_data["column_mapping"] = cm
+
+        if chart_artifacts:
+            input_data["chart_artifacts"] = chart_artifacts
+
+        return input_data
+
+    # ------------------------------------------------------------------
+    # Per-step param model lookup
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_params_model(agent_cls: Type) -> Optional[Type[BaseModel]]:
+        """Return the agent's declared ``params_model`` if any.
+
+        Reading the attribute directly off the class (rather than through
+        ``AGENT_PARAM_MODELS``) keeps the engine resilient to the test
+        pattern of hot-swapping ``registry._agents[name]`` without
+        synchronising ``registry._param_models``: the agent class is the
+        single source of truth for its own params model, so a swapped-in
+        fake without a ``params_model`` attribute correctly skips the
+        defensive re-validation. Production code paths (where the registry
+        is the source) behave identically.
+        """
+        params_model = getattr(agent_cls, "params_model", None)
+        if isinstance(params_model, type) and issubclass(params_model, BaseModel):
+            return params_model
+        return None
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+    def execute(self, plan: ExecutionPlan) -> dict:
+        sorted_ids = self._topological_sort(plan)
+        self._validate_stages(plan)
+
+        self.step_results = {}
+        step_dict = {s.step_id: s for s in plan.steps}
+
+        builder = StateGraph(PipelineState)
+
+        engine = self  # captured by closures below
+
+        def create_node_func(step):
+            step_id = step.step_id
+            agent_name = step.agent
+            params = step.params
+
+            def node_func(state: PipelineState) -> dict:
+                agent_cls = registry.get_agent_class(agent_name)
+
+                # 1. Defense-in-depth per-step Pydantic params re-validation
+                #    (req 4.1, 4.2, 10.6). Skipped only when the agent does
+                #    not declare a params_model (e.g. calculation_agent).
+                params_model = engine._resolve_params_model(agent_cls)
+                if params_model is not None:
+                    try:
+                        params_model.model_validate(params)
+                    except ValidationError as exc:
+                        message = (
+                            f"Invalid params for step '{step_id}' "
+                            f"(agent={agent_name}, "
+                            f"param_model={params_model.__name__}): {exc}"
+                        )
+                        engine.step_results[step_id] = {
+                            "agent": agent_name,
+                            "status": "failed",
+                            "summary": None,
+                            "metrics": {},
+                            "operations_applied": [],
+                            "warnings": [],
+                            "artifacts": {},
+                            "error_message": message,
+                        }
+                        # Raising surfaces the failure to the outer
+                        # try/except, which then assembles the failed
+                        # callback with the recorded step_id.
+                        raise Exception(message)
+
+                # 2. Build input_data exclusively from step.input_from. The
+                #    helper enforces the single-source input_dataframe rule
+                #    and forwards no raw state-data keys (req 4.3, 4.7, 5.5).
+                try:
+                    input_data = engine._build_input_data(step, state.data)
+                except ValueError as exc:
+                    engine.step_results[step_id] = {
+                        "agent": agent_name,
+                        "status": "failed",
+                        "summary": None,
+                        "metrics": {},
+                        "operations_applied": [],
+                        "warnings": [],
+                        "artifacts": {},
+                        "error_message": str(exc),
+                    }
+                    raise Exception(str(exc))
+
+                # 3. Invoke the agent.
+                agent_instance = agent_cls()
+                result: AgentResult = agent_instance.execute(params, input_data)
+
+                # 4. Record telemetry BEFORE any failure raises so the
+                #    failed-step lookup at the bottom is deterministic
+                #    (req 4.5).
+                engine.step_results[step_id] = {
+                    "agent": agent_name,
+                    "status": result.status,
+                    "summary": result.summary,
+                    "metrics": result.metrics,
+                    "operations_applied": result.operations_applied,
+                    "warnings": result.warnings,
+                    "artifacts": result.artifacts,
+                    "error_message": result.error_message,
+                }
+
+                if result.status in ("failed", "partial"):
+                    raise Exception(
+                        result.error_message
+                        or f"Step {step_id} failed with status {result.status}"
+                    )
+
+                # 5. Store the envelope under step.output_key (or step_id
+                #    when output_key is None). No envelope is stored under
+                #    any other key (req 4.6).
+                out_k = step.output_key if step.output_key else step_id
+                envelope = {
+                    "data": result.data,
+                    "artifacts": result.artifacts,
+                    "metrics": result.metrics,
+                    "warnings": result.warnings,
+                    "summary": result.summary,
+                }
+                return {"data": {**state.data, out_k: envelope}}
+
+            return node_func
+
+        for sid in sorted_ids:
+            step = step_dict[sid]
+            builder.add_node(sid, create_node_func(step))
+
+        # Compute transitive ancestors so we can apply transitive reduction
+        # to the depends_on graph. Without reduction LangGraph sees redundant
+        # parallel paths and the dynamic graph can mis-route edges.
+        ancestors: Dict[str, set] = {}
+        for sid in sorted_ids:
+            step = step_dict[sid]
+            step_ancestors: set = set()
+            for dep in step.depends_on:
+                step_ancestors.add(dep)
+                step_ancestors.update(ancestors.get(dep, set()))
+            ancestors[sid] = step_ancestors
+
+        for sid in sorted_ids:
+            step = step_dict[sid]
+            if not step.depends_on:
+                builder.add_edge(START, sid)
+            else:
+                essential_deps: List[str] = []
+                for dep in step.depends_on:
+                    is_redundant = False
+                    for other_dep in step.depends_on:
+                        if dep != other_dep and dep in ancestors.get(other_dep, set()):
+                            is_redundant = True
+                            break
+                    if not is_redundant:
+                        essential_deps.append(dep)
+
+                for dep in essential_deps:
+                    builder.add_edge(dep, sid)
+
+        # Terminal nodes: any step nothing depends on flows to END.
+        out_degree: Dict[str, int] = {s.step_id: 0 for s in plan.steps}
+        for step in plan.steps:
+            for dep in step.depends_on:
+                out_degree[dep] += 1
+
+        for sid, deg in out_degree.items():
+            if deg == 0:
+                builder.add_edge(sid, END)
+
+        graph = builder.compile()
+
+        start_time = time.time()
+        try:
+            initial_state = PipelineState()
+            graph.invoke(initial_state)
+            duration_ms = int((time.time() - start_time) * 1000)
+
+            reporting_step_id: Optional[str] = None
+            for step in plan.steps:
+                if step.agent == "reporting_agent":
+                    reporting_step_id = step.step_id
+                    break
+
+            output_path: Optional[str] = None
+            if reporting_step_id and reporting_step_id in self.step_results:
+                artifacts = self.step_results[reporting_step_id].get("artifacts") or {}
+                output_path = artifacts.get("primary_output_path")
+
+            summary_info: Dict[str, Any] = {
+                "steps_run": sorted_ids,
+                "step_statuses": {
+                    sid: res["status"] for sid, res in self.step_results.items()
+                },
+                "duration_ms": duration_ms,
+                "agent_summaries": self._build_agent_summaries(),
+                "step_metrics": {
+                    sid: res["metrics"] for sid, res in self.step_results.items()
+                },
+                "operations_applied_by_step": {
+                    sid: res["operations_applied"]
+                    for sid, res in self.step_results.items()
+                },
+                "warnings_by_step": {
+                    sid: res["warnings"] for sid, res in self.step_results.items()
+                },
+            }
+            if not reporting_step_id:
+                summary_info["warnings_by_step"]["engine"] = [
+                    "No reporting step was defined in the plan, so no primary "
+                    "output path was generated."
+                ]
+
+            return {
+                "status": "complete",
+                "output_path": output_path,
+                "summary": summary_info,
+            }
+        except Exception as exc:
+            duration_ms = int((time.time() - start_time) * 1000)
+
+            # The failed step is whichever sorted step landed in
+            # step_results with status in {failed, partial}. Because we
+            # write the entry BEFORE raising (above), the lookup is
+            # deterministic; the topological order ensures we surface the
+            # earliest failure when multiple steps somehow recorded one.
+            failed_step_id: Optional[str] = None
+            for sid in sorted_ids:
+                if (
+                    sid in self.step_results
+                    and self.step_results[sid]["status"] in ("failed", "partial")
+                ):
+                    failed_step_id = sid
+                    break
+            if not failed_step_id:
+                failed_step_id = sorted_ids[0] if sorted_ids else "unknown"
+
+            return {
+                "status": "failed",
+                "output_path": None,
+                "summary": {
+                    "steps_run": [
+                        sid for sid in sorted_ids if sid in self.step_results
+                    ],
+                    "step_statuses": {
+                        sid: res["status"]
+                        for sid, res in self.step_results.items()
+                    },
+                    "duration_ms": duration_ms,
+                    "agent_summaries": self._build_agent_summaries(),
+                    "step_metrics": {
+                        sid: res["metrics"]
+                        for sid, res in self.step_results.items()
+                    },
+                    "operations_applied_by_step": {
+                        sid: res["operations_applied"]
+                        for sid, res in self.step_results.items()
+                    },
+                    "warnings_by_step": {
+                        sid: res["warnings"]
+                        for sid, res in self.step_results.items()
+                    },
+                    "failed_step_id": failed_step_id,
+                    "error": str(exc),
+                    "error_message": str(exc),
+                },
+            }

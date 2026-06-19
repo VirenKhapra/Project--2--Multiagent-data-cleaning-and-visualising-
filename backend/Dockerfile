@@ -1,0 +1,20 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV ENVIRONMENT=production
+
+COPY requirements.txt .
+RUN pip install --default-timeout=100 --no-cache-dir -r requirements.txt
+
+COPY app ./app
+COPY alembic.ini .
+COPY alembic ./alembic
+
+RUN mkdir -p /app/storage/uploads /app/storage/outputs
+
+EXPOSE 8000
+
+CMD ["sh", "-c", "alembic -c alembic.ini upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

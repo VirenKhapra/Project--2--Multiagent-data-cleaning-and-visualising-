@@ -1,0 +1,406 @@
+"""Deterministic compiler that turns a validated ``PlanIntent`` into a
+fixed-shape ``ExecutionPlan``.
+
+This compiler is the single source of truth for the canonical pipeline shape
+described by the agent-pipeline-hardening spec (Component 6). It enforces:
+
+* ``ingestion_agent`` is always the first step and ``reporting_agent`` is
+  always the last step.
+* A ``cleaning_agent`` step running in ``mode="clean"`` is emitted only when
+  the intent requested cleaning AND supplied a ``cleaning_plan``. Its output
+  is published under the canonical key ``df_cleaned``.
+* When filtering is requested without cleaning, a non-destructive
+  ``filter_prep`` step is inserted (realized as a ``cleaning_agent``
+  invocation with ``mode="filter_prep"`` and the seven safe normalization
+  operations). Its output is published under ``df_filter_prepared`` and the
+  subsequent ``filter_agent`` step reads from that key, never from the raw
+  ``df_ingested`` output.
+* A ``visualization_agent`` step is only emitted when visualization is
+  enabled at the process level. Otherwise the compiler raises
+  :class:`VisualizationDisabledError`.
+* Every emitted ``output_key`` is drawn from the canonical set
+  ``{df_ingested, df_cleaned, df_filter_prepared, df_filtered,
+  df_visualized, report_output}``.
+
+Requirements satisfied: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10,
+2.11, 2.12, 2.13, 2.14, 2.15, 2.16, 2.17, 9.2.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from finflow_agent.agents.visualization_agent import VISUALIZATION_DISABLED_MESSAGE
+from finflow_agent.planning.intent_schema import PlanIntent
+from finflow_agent.state import ExecutionPlan, PlanStep
+from finflow_agent.tools.config import get_enable_visualization
+
+# ---------------------------------------------------------------------------
+# Public types and constants
+# ---------------------------------------------------------------------------
+
+
+class VisualizationDisabledError(Exception):
+    """Raised when a ``PlanIntent`` requests visualization while the
+    visualization agent is disabled at the process level.
+
+    The orchestrator catches this exception and converts it into a quarantine
+    result (Requirement 9.3 / 11.6); it MUST NOT leak past the orchestrator.
+    The canonical message is built from
+    :data:`VISUALIZATION_DISABLED_MESSAGE` so the validator, compiler, and
+    disabled agent placeholder all surface the same wording.
+    """
+
+
+# Exact message the compiler raises. Composed from the shared constant so the
+# wording stays in lockstep with the validator and the visualization agent
+# scaffold.
+VISUALIZATION_REQUESTED_BUT_DISABLED_MESSAGE: str = (
+    f"Visualization was requested, but {VISUALIZATION_DISABLED_MESSAGE}"
+)
+
+# Canonical ``output_key`` set that the compiler is permitted to emit. Listed
+# explicitly so the contract is unambiguous and the assertion in the
+# post-conditions can use a frozen set.
+CANONICAL_OUTPUT_KEYS: frozenset[str] = frozenset(
+    {
+        "df_ingested",
+        "df_cleaned",
+        "df_filter_prepared",
+        "df_filtered",
+        "df_visualized",
+        "report_output",
+    }
+)
+
+# The seven safe normalization operations the compiler emits for a
+# ``filter_prep`` step. The order matches the spec wording so audit logs and
+# downstream tests can rely on it.
+SAFE_FILTER_PREP_OPERATIONS: List[str] = [
+    "trim_whitespace",
+    "normalize_column_names",
+    "normalize_empty_strings",
+    "safe_numeric_conversion",
+    "safe_currency_conversion",
+    "safe_date_detection",
+    "categorical_value_normalization",
+]
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _require_plan_for_flag(intent: PlanIntent) -> None:
+    """Raise ``ValueError`` when any ``needs_X`` flag lacks its matching plan.
+
+    Requirement 2.13 requires the compiler to refuse intents that toggle a
+    capability flag without supplying the matching plan, for every
+    ``X ∈ {cleaning, filtering, calculation, visualization}``. The error
+    message names the missing field so the orchestrator's quarantine reason
+    is precise.
+    """
+    missing: List[str] = []
+    if intent.needs_cleaning and intent.cleaning_plan is None:
+        missing.append("cleaning_plan")
+    if intent.needs_filtering and intent.filter_plan is None:
+        missing.append("filter_plan")
+    if intent.needs_calculation and intent.calculation_plan is None:
+        missing.append("calculation_plan")
+    if intent.needs_visualization and intent.visualization_plan is None:
+        missing.append("visualization_plan")
+
+    if missing:
+        # Surface the first missing field in the message; all four checks are
+        # deterministic so the order is stable across runs. The wording
+        # ``needs_X is true but X_plan is missing`` names both the offending
+        # flag and the missing field so the orchestrator's quarantine reason
+        # is fully explanatory.
+        field = missing[0]
+        flag = "needs_" + field.replace("_plan", "")
+        raise ValueError(
+            f"{flag} is true but {field} is missing"
+        )
+
+
+def build_reporting_params(
+    intent: PlanIntent,
+    output_dir: str,
+    file_prefix: str,
+) -> Dict[str, Any]:
+    """Build the ``params`` dict for the trailing ``reporting_agent`` step.
+
+    Kept as a small helper so future enrichments (e.g. propagating reporting
+    hints, audit-log markers) have a single attachment point that does not
+    require touching the main compile function. The shape matches
+    ``ReportingAgentParams`` (Requirement 10.4): a nested ``plan`` produced
+    by ``ReportingOperationPlan`` plus the writer's optional output
+    locators.
+    """
+    return {
+        "plan": {
+            "output_format": intent.output_format,
+            "title": intent.reporting_title,
+            "sheet_name": intent.sheet_name,
+        },
+        "output_dir": output_dir,
+        "file_prefix": file_prefix,
+    }
+
+
+def _assert_canonical_output_keys(steps: List[PlanStep]) -> None:
+    """Defensive post-condition: every emitted ``output_key`` is canonical.
+
+    Requirement 2.14 forbids the compiler from publishing dataframes under
+    any key outside ``CANONICAL_OUTPUT_KEYS``. The validator (sibling task
+    8.1) re-checks this independently, but a compile-time assertion keeps
+    the contract local to this function and surfaces regressions quickly.
+    """
+    for step in steps:
+        if step.output_key is not None and step.output_key not in CANONICAL_OUTPUT_KEYS:
+            raise ValueError(
+                f"Compiler emitted non-canonical output_key {step.output_key!r} "
+                f"on step {step.step_id!r}; allowed keys: "
+                f"{sorted(CANONICAL_OUTPUT_KEYS)}"
+            )
+
+
+def _assert_filter_input_from(steps: List[PlanStep]) -> None:
+    """Defensive post-condition: every ``filter_agent`` step reads from
+    ``df_cleaned`` or ``df_filter_prepared`` and never from ``df_ingested``.
+
+    Requirement 2.10 forbids the compiler from routing the raw ingestion
+    output into the filter agent. The validator re-checks this rule, but a
+    compile-time assertion makes accidental regressions in this module fail
+    loudly during compilation rather than at validation time.
+    """
+    for step in steps:
+        if step.agent != "filter_agent":
+            continue
+        if step.input_from == ["df_ingested"]:
+            raise ValueError(
+                f"Compiler routed raw df_ingested into filter step "
+                f"{step.step_id!r}; this is forbidden by Requirement 2.10."
+            )
+        if step.input_from not in (["df_cleaned"], ["df_filter_prepared"]):
+            raise ValueError(
+                f"filter_agent step {step.step_id!r} has input_from="
+                f"{step.input_from!r}; expected ['df_cleaned'] or "
+                f"['df_filter_prepared']."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def compile_intent_to_plan(
+    intent: PlanIntent,
+    resolved_file_path: str,
+    file_type: str,
+    output_dir: str,
+    file_prefix: str,
+) -> ExecutionPlan:
+    """Deterministically translate a validated ``PlanIntent`` into an
+    ``ExecutionPlan`` whose shape obeys every clause of Requirement 2.
+
+    The function is pure: identical inputs produce identical
+    ``ExecutionPlan`` objects (modulo Python's dict ordering, which Pydantic
+    preserves for ``model_dump`` here). All branches consult
+    :func:`get_enable_visualization` rather than reading the environment
+    directly so tests can monkeypatch the flag deterministically.
+
+    See :mod:`finflow_agent.planning.compiler` module docstring for the full
+    contract.
+    """
+    # ------------------------------------------------------------------
+    # 0. Reject intents whose flags are inconsistent with their plans.
+    #    Done first so the user sees the most actionable error when several
+    #    issues are present (Requirement 2.13).
+    # ------------------------------------------------------------------
+    _require_plan_for_flag(intent)
+
+    # PDF is not a supported output_format. PlanIntent's Literal type already
+    # forbids it at validation time, but the orchestrator can mutate the
+    # field after the fact (e.g. to surface a clearer error to the LLM), so
+    # we keep an explicit guard here.
+    if intent.output_format == "pdf":
+        raise ValueError("PDF output format is not allowed.")
+
+    steps: List[PlanStep] = []
+    last_df_key: str = "df_ingested"
+
+    # ------------------------------------------------------------------
+    # 1. Ingestion is always the first step (Requirement 2.1).
+    # ------------------------------------------------------------------
+    steps.append(
+        PlanStep(
+            step_id="ingest",
+            agent="ingestion_agent",
+            params={
+                "resolved_file_path": resolved_file_path,
+                "file_type": file_type,
+            },
+            depends_on=[],
+            input_from=[],
+            output_key="df_ingested",
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Filter pipeline branch.
+    #
+    #    Three mutually exclusive sub-cases, in priority order:
+    #      (a) needs_filtering AND needs_cleaning  -> ingest, clean, filter
+    #      (b) needs_filtering AND NOT needs_cleaning -> ingest, filter_prep, filter
+    #      (c) NOT needs_filtering AND needs_cleaning -> ingest, clean
+    #    The two filtering sub-cases share the trailing ``filter_agent``
+    #    step but differ in which preparation step feeds it.
+    # ------------------------------------------------------------------
+    if intent.needs_filtering and intent.filter_plan is not None:
+        if intent.needs_cleaning and intent.cleaning_plan is not None:
+            # 2a. Full cleaning requested; emit a destructive cleaning_agent
+            #     step in ``mode="clean"`` (Requirement 2.2).
+            steps.append(
+                PlanStep(
+                    step_id="clean",
+                    agent="cleaning_agent",
+                    params={
+                        "plan": intent.cleaning_plan.model_dump(),
+                        "mode": "clean",
+                    },
+                    depends_on=["ingest"],
+                    input_from=["df_ingested"],
+                    output_key="df_cleaned",
+                )
+            )
+            filter_input = "df_cleaned"
+            filter_depends_on = "clean"
+            last_df_key = "df_cleaned"
+        else:
+            # 2b. Filtering without cleaning; insert a non-destructive
+            #     filter_prep step (Requirements 2.6, 2.7). The step is a
+            #     cleaning_agent invocation with ``mode="filter_prep"`` and
+            #     ONLY the seven safe operations enumerated in
+            #     ``SAFE_FILTER_PREP_OPERATIONS``. ``params`` deliberately
+            #     omits ``plan`` per the task contract; the cleaning_agent
+            #     dispatch (sibling task 5.1) handles the ``filter_prep``
+            #     mode using the operations list.
+            steps.append(
+                PlanStep(
+                    step_id="filter_prep",
+                    agent="cleaning_agent",
+                    params={
+                        "mode": "filter_prep",
+                        "operations": list(SAFE_FILTER_PREP_OPERATIONS),
+                    },
+                    depends_on=["ingest"],
+                    input_from=["df_ingested"],
+                    output_key="df_filter_prepared",
+                )
+            )
+            filter_input = "df_filter_prepared"
+            filter_depends_on = "filter_prep"
+            last_df_key = "df_filter_prepared"
+
+        # The filter step itself. Requirement 2.10: ``input_from`` must be
+        # exactly one of ``["df_cleaned"]`` or ``["df_filter_prepared"]``,
+        # never ``["df_ingested"]``. The post-condition assertion below
+        # re-checks this.
+        steps.append(
+            PlanStep(
+                step_id="filter",
+                agent="filter_agent",
+                params={"plan": intent.filter_plan.model_dump()},
+                depends_on=[filter_depends_on],
+                input_from=[filter_input],
+                output_key="df_filtered",
+            )
+        )
+        last_df_key = "df_filtered"
+
+    elif intent.needs_cleaning and intent.cleaning_plan is not None:
+        # 2c. Clean-only branch (no filtering requested).
+        steps.append(
+            PlanStep(
+                step_id="clean",
+                agent="cleaning_agent",
+                params={
+                    "plan": intent.cleaning_plan.model_dump(),
+                    "mode": "clean",
+                },
+                depends_on=["ingest"],
+                input_from=["df_ingested"],
+                output_key="df_cleaned",
+            )
+        )
+        last_df_key = "df_cleaned"
+
+    # ------------------------------------------------------------------
+    # 3. Visualization (scaffolded; gated by ENABLE_VISUALIZATION).
+    #
+    #    Only entered when the intent both requested visualization and
+    #    supplied a plan; the missing-plan branch was already raised in
+    #    step 0. The flag is read via ``get_enable_visualization`` so test
+    #    fixtures can monkeypatch it deterministically.
+    # ------------------------------------------------------------------
+    if intent.needs_visualization and intent.visualization_plan is not None:
+        if not get_enable_visualization():
+            raise VisualizationDisabledError(
+                VISUALIZATION_REQUESTED_BUT_DISABLED_MESSAGE
+            )
+        steps.append(
+            PlanStep(
+                step_id="visualize",
+                agent="visualization_agent",
+                params={"plan": intent.visualization_plan.model_dump()},
+                depends_on=[steps[-1].step_id],
+                input_from=[last_df_key],
+                output_key="df_visualized",
+            )
+        )
+        last_df_key = "df_visualized"
+
+    # ------------------------------------------------------------------
+    # 4. Reporting is always the last step (Requirement 2.1).
+    # ------------------------------------------------------------------
+    steps.append(
+        PlanStep(
+            step_id="report",
+            agent="reporting_agent",
+            params=build_reporting_params(intent, output_dir, file_prefix),
+            depends_on=[steps[-1].step_id],
+            input_from=[last_df_key],
+            output_key="report_output",
+        )
+    )
+
+    plan = ExecutionPlan(steps=steps)
+
+    # ------------------------------------------------------------------
+    # 5. Sanity post-conditions. The validator re-checks all of these but
+    #    asserting them here pins the contract local to the compiler and
+    #    surfaces regressions in this module immediately.
+    # ------------------------------------------------------------------
+    assert plan.steps[0].agent == "ingestion_agent", (
+        "Compiler post-condition violated: first step must be ingestion_agent"
+    )
+    assert plan.steps[-1].agent == "reporting_agent", (
+        "Compiler post-condition violated: last step must be reporting_agent"
+    )
+    _assert_canonical_output_keys(plan.steps)
+    _assert_filter_input_from(plan.steps)
+
+    return plan
+
+
+__all__ = [
+    "VisualizationDisabledError",
+    "VISUALIZATION_REQUESTED_BUT_DISABLED_MESSAGE",
+    "CANONICAL_OUTPUT_KEYS",
+    "SAFE_FILTER_PREP_OPERATIONS",
+    "build_reporting_params",
+    "compile_intent_to_plan",
+]

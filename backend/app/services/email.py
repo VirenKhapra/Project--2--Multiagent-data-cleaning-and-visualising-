@@ -1,0 +1,123 @@
+from email.message import EmailMessage
+import logging
+import smtplib
+from datetime import datetime, timedelta, timezone
+import secrets
+
+import jwt
+from starlette.concurrency import run_in_threadpool
+
+from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+REVIEW_TOKEN_EXPIRE_HOURS = 72
+
+
+async def send_email(to_email: str | None, subject: str, body: str) -> None:
+    settings = get_settings()
+    if not settings.emails_enabled or not settings.smtp_host or not to_email:
+        return
+
+    def _send() -> None:
+        message = EmailMessage()
+        message["From"] = settings.smtp_from_email
+        message["To"] = to_email
+        message["Subject"] = subject
+        message.set_content(body)
+
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as smtp:
+            if settings.smtp_tls:
+                smtp.starttls()
+            if settings.smtp_username and settings.smtp_password:
+                smtp.login(settings.smtp_username, settings.smtp_password)
+            smtp.send_message(message)
+
+    try:
+        await run_in_threadpool(_send)
+    except Exception:
+        logger.exception("Failed to send email notification to %s", to_email)
+
+
+def generate_review_token(submission_id, manager_id) -> str:
+    settings = get_settings()
+    payload = {
+        "submission_id": str(submission_id),
+        "manager_id": str(manager_id),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=REVIEW_TOKEN_EXPIRE_HOURS),
+        "purpose": "review_link",
+    }
+    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+
+
+def verify_review_token(token: str) -> dict:
+    settings = get_settings()
+    try:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret_key,
+            algorithms=[settings.jwt_algorithm]
+        )
+        if payload.get("purpose") != "review_link":
+            raise ValueError("Invalid token purpose")
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise ValueError("This review link has expired. Please ask the employee to re-submit or contact your admin.")
+    except jwt.InvalidTokenError:
+        raise ValueError("Invalid review link.")
+
+
+def manager_submission_link(submission_id, manager_id) -> str:
+    settings = get_settings()
+    token = generate_review_token(submission_id, manager_id)
+    return f"{settings.frontend_base_url.rstrip('/')}/manager?token={token}"
+
+
+# ---------------------------------------------------------------------------
+# Password-change email verification (Layer: 15-min JWT link)
+# ---------------------------------------------------------------------------
+PASSWORD_CHANGE_TOKEN_EXPIRE_MINUTES = 15
+
+
+def generate_password_change_token(user_id) -> tuple[str, str, datetime]:
+    settings = get_settings()
+    token_id = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=PASSWORD_CHANGE_TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "user_id": str(user_id),
+        "jti": token_id,
+        "exp": expires_at,
+        "purpose": "password_change",
+    }
+    token = jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+    return token, token_id, expires_at
+
+
+def verify_password_change_token(token: str) -> dict:
+    settings = get_settings()
+    try:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret_key,
+            algorithms=[settings.jwt_algorithm]
+        )
+        if payload.get("purpose") != "password_change":
+            raise ValueError("Invalid token purpose")
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise ValueError("This password change link has expired. Please request a new one.")
+    except jwt.InvalidTokenError:
+        raise ValueError("Invalid password change link.")
+
+
+async def send_password_change_email(to_email: str, verification_token: str) -> None:
+    settings = get_settings()
+    verification_link = f"{settings.frontend_base_url.rstrip('/')}/verify-password?token={verification_token}"
+    subject = "LedgerFlow — Verify your password change"
+    body = (
+        f"You requested a password change on LedgerFlow.\n\n"
+        f"Click the link below to confirm. This link expires in {PASSWORD_CHANGE_TOKEN_EXPIRE_MINUTES} minutes:\n\n"
+        f"{verification_link}\n\n"
+        f"If you did not request this change, please ignore this email."
+    )
+    await send_email(to_email, subject, body)
