@@ -65,6 +65,21 @@ def test_contains_uses_literal_matching():
     assert len(out.data) == 1
     assert out.data["Code"].iloc[0] == "A[B]"
 
+def test_filter_in_uses_normalized_text_matching():
+    df = pd.DataFrame({"payment_method": ["PayPal", "cash", "pay pal", "credit card"]})
+    plan = FilterOperationPlan(
+        conditions=[
+            FilterCondition(
+                column="payment_method",
+                operator="in",
+                value=["paypal", "cash"],
+            )
+        ]
+    )
+    out = execute_filter_plan(df, plan)
+
+    assert list(out.data["payment_method"]) == ["PayPal", "cash", "pay pal"]
+
 def test_filter_missing_column_fails():
     df = pd.DataFrame({"A": [1]})
     plan = FilterOperationPlan(conditions=[FilterCondition(column="B", operator="gt", value=0)])
