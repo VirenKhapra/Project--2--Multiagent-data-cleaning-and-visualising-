@@ -577,6 +577,26 @@ def _call_groq_json_sync(messages: list[dict[str, str]]) -> dict[str, Any]:
     client = Groq(api_key=api_key)
     max_retries = 2
     for attempt in range(max_retries + 1):
+        # --- Telemetry: log call start ---
+        _telemetry_ctx = None
+        try:
+            from app.services.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed
+            _telemetry_ctx = log_llm_started(
+                service="backend",
+                operation="legacy_sync_extraction",
+                caller_file="semantic_extractor.py",
+                caller_function="_call_groq_json_sync",
+                model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                api_key_source="GROQ_API_KEY",
+                api_key=api_key,
+                attempt=attempt + 1,
+                trigger="extract_semantic_intent_sync",
+                messages=messages,
+            )
+        except Exception:
+            pass
+        # --- End telemetry start ---
+
         try:
             response = client.chat.completions.create(
                 model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
@@ -586,10 +606,38 @@ def _call_groq_json_sync(messages: list[dict[str, str]]) -> dict[str, Any]:
                 max_tokens=2048,
             )
             content = response.choices[0].message.content or "{}"
+
+            # --- Telemetry: log success ---
+            if _telemetry_ctx:
+                try:
+                    usage = response.usage
+                    log_llm_completed(
+                        _telemetry_ctx,
+                        prompt_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
+                        completion_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+                        total_tokens=getattr(usage, "total_tokens", 0) if usage else 0,
+                        finish_reason=getattr(response.choices[0], "finish_reason", "") if response.choices else "",
+                    )
+                except Exception:
+                    pass
+            # --- End telemetry success ---
+
             return json.loads(content)
         except Exception as e:
             error_str = str(e)
             if "rate_limit" in error_str or "429" in error_str:
+                # --- Telemetry: log failure (rate limit) ---
+                if _telemetry_ctx:
+                    try:
+                        log_llm_failed(
+                            _telemetry_ctx,
+                            status_code=429,
+                            error_type="rate_limit",
+                            error_message=error_str,
+                        )
+                    except Exception:
+                        pass
+                # --- End telemetry failure ---
                 if attempt < max_retries:
                     wait_time = (attempt + 1) * 5  # 5s, 10s
                     logger.info("Rate limited, retrying in %ds (attempt %d/%d)", wait_time, attempt + 1, max_retries)
@@ -598,9 +646,34 @@ def _call_groq_json_sync(messages: list[dict[str, str]]) -> dict[str, Any]:
             # Groq sometimes rejects valid-ish JSON via json_validate_failed
             # but includes the generated output — try to salvage it
             if "failed_generation" in error_str:
+                # --- Telemetry: log failure (parse) ---
+                if _telemetry_ctx:
+                    try:
+                        log_llm_failed(
+                            _telemetry_ctx,
+                            status_code=0,
+                            error_type="json_validate_failed",
+                            error_message=error_str,
+                        )
+                    except Exception:
+                        pass
+                # --- End telemetry failure ---
                 salvaged = _try_salvage_failed_generation(e)
                 if salvaged is not None:
                     return salvaged
+            else:
+                # --- Telemetry: log failure (generic) ---
+                if _telemetry_ctx:
+                    try:
+                        log_llm_failed(
+                            _telemetry_ctx,
+                            status_code=0,
+                            error_type=type(e).__name__,
+                            error_message=error_str,
+                        )
+                    except Exception:
+                        pass
+                # --- End telemetry failure ---
             logger.error("Groq semantic extraction failed: %s", e)
             raise ValueError(f"LLM extraction call failed: {e}") from e
 

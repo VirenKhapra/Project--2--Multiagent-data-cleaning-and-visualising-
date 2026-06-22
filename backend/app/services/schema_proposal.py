@@ -39,6 +39,22 @@ def build_schema_proposal_from_file(
     max_preview_rows: int,
     instruction: str = "",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    # --- Telemetry: log build_schema_proposal_called ---
+    try:
+        import json as _json
+        import logging as _logging
+        from datetime import datetime, timezone
+        _telem_logger = _logging.getLogger("llm_telemetry")
+        _telem_logger.info(_json.dumps({
+            "event": "build_schema_proposal_called",
+            "submission_instruction": (instruction or "")[:50],
+            "source": "poll_fallback",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }))
+    except Exception:
+        pass
+    # --- End telemetry ---
+
     extension = path.suffix.lower()
     if extension in {".csv", ".tsv", ".xlsx", ".xls"}:
         frame, total_rows = _load_tabular_preview(path, extension, max_preview_rows=max_preview_rows)

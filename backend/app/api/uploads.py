@@ -166,6 +166,23 @@ def get_schema_proposal_with_fallback(submission: Submission) -> dict:
     if file_path.suffix.lower() not in SCHEMA_APPROVAL_TABULAR_EXTENSIONS:
         return {}
 
+    # --- Telemetry: log polling decision ---
+    try:
+        from app.services.llm_telemetry import log_polling_decision
+        log_polling_decision(
+            submission_id=str(getattr(submission, "id", "")),
+            endpoint="get_schema_proposal_with_fallback",
+            schema_proposal_present=False,
+            summary_present=bool(payload),
+            canonical_intent_present=bool(payload.get("canonical_intent")),
+            fallback_reason="schema_proposal missing, recovered failed, rebuilding from file",
+            will_rebuild=True,
+            will_call_llm=False,
+        )
+    except Exception:
+        pass
+    # --- End telemetry ---
+
     rebuilt = build_schema_proposal_from_file(
         file_path,
         max_preview_rows=get_settings().max_preview_rows,
@@ -663,6 +680,7 @@ async def ensure_output_file(db: AsyncSession, submission: Submission) -> Path |
         output_path.write_text(frame.to_string(index=False), encoding="utf-8")
 
     submission.output_path = str(output_path)
+    submission.output_file_path = str(output_path)
     await db.commit()
     await db.refresh(submission)
     return output_path

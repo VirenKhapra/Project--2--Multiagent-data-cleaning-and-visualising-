@@ -410,7 +410,41 @@ def _try_llm_column_resolution(
             [c.original_name for c in profile.columns],
         )
 
+        # --- Telemetry: log call start ---
+        _telemetry_ctx = None
+        try:
+            from finflow_agent.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed
+            _telemetry_ctx = log_llm_started(
+                service="agent-service",
+                operation="column_resolution",
+                caller_file="column_resolver.py",
+                caller_function="_try_llm_column_resolution",
+                model="llama-3.3-70b-versatile",
+                api_key_source="GROQ_API_KEY",
+                api_key=os.environ.get("GROQ_API_KEY", ""),
+                attempt=1,
+                trigger=f"resolve:{requested_field}",
+                messages=[{"role": "user", "content": prompt_text}],
+            )
+        except Exception:
+            pass
+        # --- End telemetry start ---
+
         result = structured_llm.invoke(prompt_text)
+
+        # --- Telemetry: log success (LangChain doesn't expose token usage directly) ---
+        if _telemetry_ctx:
+            try:
+                log_llm_completed(
+                    _telemetry_ctx,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    finish_reason="stop",
+                )
+            except Exception:
+                pass
+        # --- End telemetry success ---
 
         # Parse the response
         if isinstance(result, _LLMColumnChoice):
@@ -466,6 +500,18 @@ def _try_llm_column_resolution(
         )
 
     except Exception as exc:
+        # --- Telemetry: log failure ---
+        if _telemetry_ctx:
+            try:
+                log_llm_failed(
+                    _telemetry_ctx,
+                    status_code=0,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception:
+                pass
+        # --- End telemetry failure ---
         # Never crash the resolver on LLM failure — fall through gracefully.
         logger.warning(
             "LLM column resolution failed for field %r: %s",

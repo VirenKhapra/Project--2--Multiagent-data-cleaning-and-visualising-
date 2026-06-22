@@ -312,14 +312,64 @@ def call_groq_json(messages: list, schema: dict) -> dict:
     #    this guard before the request leaves the process.
     assert_no_eval_strings(normalized_messages)
 
+    # --- Telemetry: log call start ---
+    _telemetry_ctx = None
+    try:
+        from finflow_agent.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed
+        _telemetry_ctx = log_llm_started(
+            service="agent-service",
+            operation="plan_generation",
+            caller_file="llm.py",
+            caller_function="call_groq_json",
+            model=DEFAULT_GROQ_MODEL,
+            api_key_source="GROQ_API_KEY",
+            api_key=os.environ.get("GROQ_API_KEY", ""),
+            attempt=1,
+            trigger="call_groq_json",
+            messages=normalized_messages,
+        )
+    except Exception:
+        pass
+    # --- End telemetry start ---
+
     client = get_groq_client()
 
-    chat_completion = client.chat.completions.create(
-        messages=normalized_messages,
-        model=DEFAULT_GROQ_MODEL,
-        response_format={"type": "json_object"},
-        temperature=0,
-    )
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=normalized_messages,
+            model=DEFAULT_GROQ_MODEL,
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+    except Exception as exc:
+        # --- Telemetry: log failure ---
+        if _telemetry_ctx:
+            try:
+                log_llm_failed(
+                    _telemetry_ctx,
+                    status_code=getattr(exc, "status_code", 0),
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception:
+                pass
+        # --- End telemetry failure ---
+        raise
+
+    # --- Telemetry: log success ---
+    if _telemetry_ctx:
+        try:
+            usage = chat_completion.usage
+            log_llm_completed(
+                _telemetry_ctx,
+                prompt_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
+                completion_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+                total_tokens=getattr(usage, "total_tokens", 0) if usage else 0,
+                finish_reason=getattr(chat_completion.choices[0], "finish_reason", "") if chat_completion.choices else "",
+            )
+        except Exception:
+            pass
+    # --- End telemetry success ---
 
     import json
 

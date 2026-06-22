@@ -81,6 +81,7 @@ async def requeue_submission(
     submission.preferred_agent_name = preferred_agent_name.strip() if preferred_agent_name else None
     if clear_existing_output:
         submission.output_path = None
+        submission.output_file_path = None
 
     await db.execute(delete(SubmissionRecord).where(SubmissionRecord.submission_id == submission.id))
     await db.commit()

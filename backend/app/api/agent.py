@@ -509,6 +509,7 @@ async def agent_callback(
         submission.summary = payload.summary
         if payload.output_path:
             submission.output_path = payload.output_path
+            submission.output_file_path = payload.output_path
         submission.completed_at = _utc_now()
         callback_event.processing_status = "completed"
         callback_event.processed_at = _utc_now()

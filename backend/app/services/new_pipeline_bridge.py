@@ -166,7 +166,7 @@ class _GroqResolver:
     def __init__(self, api_key: str) -> None:
         self._api_key = api_key
         self._base_url = "https://api.groq.com/openai/v1/chat/completions"
-        self._model = os.environ.get("GROQ_BRIDGE_MODEL", "llama-3.3-70b-versatile")
+        self._model = os.environ.get("GROQ_BRIDGE_MODEL", "gemma2-9b-it")
 
     async def call(
         self,
@@ -179,6 +179,25 @@ class _GroqResolver:
         """Call Groq chat completions API using httpx."""
         import httpx
         from finflow_agent.grounding.llm_adapter import LLMProviderError, LLMResponse
+
+        # --- Telemetry: log call start ---
+        try:
+            from app.services.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed
+            _telemetry_ctx = log_llm_started(
+                service="backend",
+                operation="new_pipeline_extraction",
+                caller_file="new_pipeline_bridge.py",
+                caller_function="_GroqResolver.call",
+                model=self._model,
+                api_key_source="GROQ_BRIDGE_API_KEY",
+                api_key=self._api_key,
+                attempt=1,
+                trigger=str(call_site),
+                messages=messages,
+            )
+        except Exception:
+            _telemetry_ctx = None
+        # --- End telemetry start ---
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -204,6 +223,18 @@ class _GroqResolver:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(self._base_url, json=payload, headers=headers)
         except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            # --- Telemetry: log failure ---
+            if _telemetry_ctx:
+                try:
+                    log_llm_failed(
+                        _telemetry_ctx,
+                        status_code=0,
+                        error_type="timeout",
+                        error_message=str(exc),
+                    )
+                except Exception:
+                    pass
+            # --- End telemetry failure ---
             raise LLMProviderError(
                 f"Groq API call failed: {exc}",
                 error_type="timeout",
@@ -214,6 +245,19 @@ class _GroqResolver:
 
         if resp.status_code != 200:
             error_type = "rate_limit" if resp.status_code == 429 else "server_error"
+            # --- Telemetry: log failure ---
+            if _telemetry_ctx:
+                try:
+                    log_llm_failed(
+                        _telemetry_ctx,
+                        status_code=resp.status_code,
+                        error_type=error_type,
+                        error_message=resp.text[:200],
+                        headers=dict(resp.headers),
+                    )
+                except Exception:
+                    pass
+            # --- End telemetry failure ---
             raise LLMProviderError(
                 f"Groq API returned {resp.status_code}: {resp.text[:200]}",
                 error_type=error_type,
@@ -225,11 +269,38 @@ class _GroqResolver:
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
+            # --- Telemetry: log failure ---
+            if _telemetry_ctx:
+                try:
+                    log_llm_failed(
+                        _telemetry_ctx,
+                        status_code=resp.status_code,
+                        error_type="parse_error",
+                        error_message="Groq API response has unexpected structure",
+                    )
+                except Exception:
+                    pass
+            # --- End telemetry failure ---
             raise LLMProviderError(
                 "Groq API response has unexpected structure",
                 error_type="server_error",
                 call_site=str(call_site),
             )
+
+        # --- Telemetry: log success ---
+        if _telemetry_ctx:
+            try:
+                usage = data.get("usage", {})
+                log_llm_completed(
+                    _telemetry_ctx,
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0),
+                    total_tokens=usage.get("total_tokens", 0),
+                    finish_reason=data.get("choices", [{}])[0].get("finish_reason", ""),
+                )
+            except Exception:
+                pass
+        # --- End telemetry success ---
 
         # Attempt to parse JSON from content
         parsed = None

@@ -129,6 +129,7 @@ class Submission(Base):
     intent_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     capability_version: Mapped[str | None] = mapped_column(String(32))
     output_path: Mapped[str | None] = mapped_column(String(500))
+    output_file_path: Mapped[str | None] = mapped_column(String(500))
     preferred_agent_name: Mapped[str | None] = mapped_column(String(120))
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

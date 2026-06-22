@@ -353,6 +353,26 @@ def _llm_ground_clause(
     # The top 10 candidates sorted by score are sufficient context.
     top_candidates = candidates[:10]
 
+    # --- Telemetry: log call start ---
+    _telemetry_ctx = None
+    try:
+        from finflow_agent.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed
+        _telemetry_ctx = log_llm_started(
+            service="agent-service",
+            operation="predicate_grounding",
+            caller_file="predicate_grounder.py",
+            caller_function="_llm_ground_clause",
+            model="llama-3.3-70b-versatile",
+            api_key_source="GROQ_API_KEY",
+            api_key=os.environ.get("GROQ_API_KEY", ""),
+            attempt=1,
+            trigger=f"ground:{clause.requested_field}",
+            messages=[{"role": "user", "content": f"requested_field={clause.requested_field}, operator={clause.operator}, value={clause.value}"}],
+        )
+    except Exception:
+        pass
+    # --- End telemetry start ---
+
     try:
         llm = get_chat_groq(model_name="llama-3.3-70b-versatile", temperature=0)
         structured_llm = llm.with_structured_output(LLMGroundingDecision)
@@ -398,10 +418,37 @@ def _llm_ground_clause(
                 "candidates": "\n".join(candidate_lines),
             }
         )
+
+        # --- Telemetry: log success (LangChain doesn't expose token usage directly) ---
+        if _telemetry_ctx:
+            try:
+                log_llm_completed(
+                    _telemetry_ctx,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    finish_reason="stop",
+                )
+            except Exception:
+                pass
+        # --- End telemetry success ---
+
         if isinstance(result, LLMGroundingDecision):
             return result
         return LLMGroundingDecision.model_validate(result)
     except Exception as exc:  # pragma: no cover - defensive
+        # --- Telemetry: log failure ---
+        if _telemetry_ctx:
+            try:
+                log_llm_failed(
+                    _telemetry_ctx,
+                    status_code=0,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            except Exception:
+                pass
+        # --- End telemetry failure ---
         logger.warning("Predicate grounding LLM fallback failed: %s", exc)
         return None
 
