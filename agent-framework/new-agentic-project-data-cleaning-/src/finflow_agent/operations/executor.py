@@ -117,12 +117,42 @@ def _resolve_aggregate_value(df: pd.DataFrame, cond) -> "FilterCondition":
     else:
         agg_column = cond.column
 
+    # Check for conditional filter in args (e.g., "avg of female age")
+    args = value.get("args")
+    conditional_filter = None
+    if isinstance(args, list) and args:
+        arg = args[0] if isinstance(args[0], dict) else {}
+        conditional_filter = arg.get("filter")
+        # Also extract field_ref from args if top-level is missing
+        if not field_ref and isinstance(arg.get("field_ref"), dict):
+            agg_column = (
+                arg["field_ref"].get("resolved_column")
+                or arg["field_ref"].get("reference_text")
+                or cond.column
+            )
+
     col_lower_map = {c.lower(): c for c in df.columns}
     resolved_col = col_lower_map.get(agg_column.lower(), agg_column)
     if resolved_col not in df.columns:
         resolved_col = cond.column
 
-    raw_series = df[resolved_col].astype(str).str.replace(r'[$€£¥,]', '', regex=True).str.strip()
+    # Apply conditional filter if present (e.g., only female rows for avg)
+    working_df = df
+    if conditional_filter and isinstance(conditional_filter, dict):
+        filter_val = str(conditional_filter.get("value", "")).strip().lower()
+        filter_field_ref = conditional_filter.get("field_ref")
+        if isinstance(filter_field_ref, dict):
+            filter_col_name = (
+                filter_field_ref.get("resolved_column")
+                or filter_field_ref.get("reference_text")
+                or ""
+            )
+            resolved_filter_col = col_lower_map.get(filter_col_name.lower())
+            if resolved_filter_col and resolved_filter_col in df.columns:
+                mask = df[resolved_filter_col].astype(str).str.lower().str.strip() == filter_val
+                working_df = df[mask]
+
+    raw_series = working_df[resolved_col].astype(str).str.replace(r'[$€£¥,]', '', regex=True).str.strip()
     numeric_series = pd.to_numeric(raw_series, errors="coerce")
 
     agg_map = {
