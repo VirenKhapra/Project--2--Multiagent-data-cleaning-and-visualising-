@@ -56,8 +56,8 @@ def _get_field_by_id(
 
 
 def _is_numeric_field(field: FieldMetadata) -> bool:
-    """Check if a field has a numeric data_type (integer or float)."""
-    return field.data_type in ("integer", "float")
+    """Check if a field has a numeric data_type (integer, float, or number)."""
+    return field.data_type in ("integer", "float", "number")
 
 
 class LineChartValidator:

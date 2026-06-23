@@ -194,15 +194,70 @@ class VisualizationExecutor:
         primary_measure = self._find_primary_measure(encoding, fields)
         title = self._generate_title(resolved_chart_type, primary_measure)
 
+        # Map encoding keys to chart-type-specific keys expected by frontend
+        frontend_encoding = self._map_encoding_for_frontend(encoding, resolved_chart_type, fields)
+
         return VisualizationSpec(
             operation_id=operation_id,
             source_result_id=source_result_id,
             status="ready",
             chart_type=resolved_chart_type,
             title=title,
-            encoding=encoding,
+            encoding=frontend_encoding,
             data=rows,  # Zero-calculation: copy rows verbatim. Req 3.1, 3.4
         )
+
+    def _map_encoding_for_frontend(
+        self, encoding: dict[str, str], chart_type: str, fields: list[FieldMetadata]
+    ) -> dict[str, str]:
+        """Map generic x/y encoding to chart-type-specific keys expected by frontend.
+
+        Frontend components expect:
+        - Pie: {category, value, category_label, value_label}
+        - Bar: {x, y, x_label, y_label}
+        - Line: {x, y, x_label, y_label}
+        - Scatter: {x, y, x_label, y_label}
+        """
+        if not encoding:
+            # Auto-detect from fields
+            category_fields = [f for f in fields if f.role in ("category", "dimension")]
+            measure_fields = [f for f in fields if f.role == "measure"]
+            if chart_type == "pie" and category_fields and measure_fields:
+                return {
+                    "category": category_fields[0].id,
+                    "value": measure_fields[0].id,
+                    "category_label": category_fields[0].label,
+                    "value_label": measure_fields[0].label,
+                }
+            elif category_fields and measure_fields:
+                return {
+                    "x": category_fields[0].id,
+                    "y": measure_fields[0].id,
+                    "x_label": category_fields[0].label,
+                    "y_label": measure_fields[0].label,
+                }
+            return encoding
+
+        x_field_id = encoding.get("x", "")
+        y_field_id = encoding.get("y", "")
+        field_map = {f.id: f for f in fields}
+        x_label = field_map[x_field_id].label if x_field_id in field_map else x_field_id
+        y_label = field_map[y_field_id].label if y_field_id in field_map else y_field_id
+
+        if chart_type == "pie":
+            return {
+                "category": x_field_id,
+                "value": y_field_id,
+                "category_label": x_label,
+                "value_label": y_label,
+            }
+
+        # For bar, line, scatter — keep x/y but add labels
+        return {
+            **encoding,
+            "x_label": x_label,
+            "y_label": y_label,
+        }
 
     def _normalize_chart_type(self, chart_type: str | None) -> str:
         """Normalize null/empty/missing chart_type to "auto". Req 15.4."""
@@ -262,7 +317,7 @@ class VisualizationExecutor:
 
             # Check data_type for measure axes. Req 17.2
             if axis_role in measure_axes:
-                if field.data_type not in ("integer", "float"):
+                if field.data_type not in ("integer", "float", "number"):
                     failing_fields.append(field_id)
                     continue
 
@@ -287,7 +342,7 @@ class VisualizationExecutor:
                         continue
                 # If field has role "measure", validate as measure axis
                 elif field.role == "measure":
-                    if field.data_type not in ("integer", "float"):
+                    if field.data_type not in ("integer", "float", "number"):
                         failing_fields.append(field_id)
                         continue
                 # Otherwise (category/dimension), validate as category
@@ -325,7 +380,7 @@ class VisualizationExecutor:
         # Fall back to any numeric field in encoding
         for _axis, field_id in encoding.items():
             field = field_map.get(field_id)
-            if field and field.data_type in ("integer", "float"):
+            if field and field.data_type in ("integer", "float", "number"):
                 return field
 
         return None

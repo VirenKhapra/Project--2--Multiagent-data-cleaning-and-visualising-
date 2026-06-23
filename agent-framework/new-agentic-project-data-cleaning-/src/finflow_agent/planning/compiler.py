@@ -56,6 +56,7 @@ from finflow_agent.operations.schemas import (
     RemoveEmptyRowsOperation,
     TrimWhitespaceOperation,
     VisualizationOperationPlan,
+    ChartSpec,
 )
 from finflow_agent.planning.canonical_intent import (
     CANONICAL_INTENT_SCHEMA_VERSION,
@@ -119,6 +120,7 @@ CANONICAL_OUTPUT_KEYS: frozenset[str] = frozenset(
         "df_filter_prepared",
         "df_filtered",
         "df_calculated",
+        "df_calc_viz",
         "df_visualized",
         "report_output",
     }
@@ -482,6 +484,12 @@ def compile_intent_to_plan(
                 needs_calc_step = True
                 break
 
+        # Skip calc_viz if a calculate step already produced the grouped data
+        # (avoids double-aggregating when calculate and visualize use the same grouping)
+        has_prior_calc = any(s.step_id == "calculate" for s in steps)
+        if has_prior_calc:
+            needs_calc_step = False
+
         if needs_calc_step:
             # Build calculation operations for charts that need aggregation
             calc_operations: List[Dict[str, Any]] = []
@@ -636,6 +644,11 @@ def _canonical_intent_to_plan_intent(
     filter_limit: int | None = None
     drop_columns_seen = False
     calculation_operations: list = []
+    visualize_chart_type: str | None = None
+    visualize_group_by: list[str] | None = None
+    visualize_aggregation: str | None = None
+    visualize_measure: str | None = None
+    visualize_output_field: str | None = None
 
     for action in intent.actions:
         # Resolve the semantic operation type to a canonical action kind via
@@ -674,7 +687,8 @@ def _canonical_intent_to_plan_intent(
             continue
 
         if isinstance(action, SortRowsIntent):
-            raise ValueError("Canonical sort_rows intent is not supported by the current compiler.")
+            # Sort is not yet compiled into the execution plan — skip gracefully
+            continue
         if isinstance(action, CalculateIntent):
             ops = _build_calculation_operations(action)
             if ops:
@@ -714,6 +728,89 @@ def _canonical_intent_to_plan_intent(
             ]
         )
 
+    # Build visualization plan from extracted chart fields
+    visualization_plan: VisualizationOperationPlan | None = None
+    if needs_visualization:
+        chart_type = visualize_chart_type or "bar"
+        # Normalize chart type to supported values
+        chart_type_map = {"pie": "pie", "bar": "bar", "line": "line", "scatter": "scatter", "histogram": "bar", "area": "area"}
+        resolved_chart_type = chart_type_map.get(chart_type.lower(), "bar")
+
+        # Determine x and y fields from context
+        x_field = ""
+        y_field = ""
+        agg_type = visualize_aggregation or "count"
+
+        # Priority 1: Use explicit visualization group_by/measure
+        if visualize_group_by and isinstance(visualize_group_by, list) and visualize_group_by:
+            x_field = visualize_group_by[0]
+        if visualize_measure:
+            y_field = visualize_measure
+
+        # Priority 2: Derive from calculation operations if they have group_by
+        if not x_field and calculation_operations:
+            for calc_op in calculation_operations:
+                op_dict = calc_op if isinstance(calc_op, dict) else {}
+                gb = op_dict.get("group_by")
+                if gb and isinstance(gb, list) and gb:
+                    x_field = gb[0]
+                    if not y_field:
+                        col = op_dict.get("output_column") or op_dict.get("column", "")
+                        op_t = op_dict.get("type", "")
+                        y_field = op_dict.get("output_column") or f"{op_t.replace('group_', '')}_{col}"
+                        agg_type = op_t.replace("group_", "") if "group_" in op_t else op_t
+                    break
+
+        if not y_field:
+            y_field = visualize_output_field or "record_count"
+
+        # Use source_columns as fallback for x if not specified
+        if not x_field and source_columns:
+            # Pick a likely categorical column
+            for col in source_columns:
+                col_lower = col.lower()
+                if any(kw in col_lower for kw in ["gender", "category", "type", "status", "class", "department", "group"]):
+                    x_field = col
+                    break
+            if not x_field:
+                x_field = source_columns[0]
+
+        # For aggregation charts (pie, bar), ensure group_by is set
+        # so the pre-aggregation step is triggered
+        effective_group_by = visualize_group_by
+        if not effective_group_by and x_field and resolved_chart_type in ("pie", "bar"):
+            effective_group_by = [x_field]
+
+        # Determine the measure column for the aggregation step
+        effective_measure = visualize_measure
+        if not effective_measure and calculation_operations:
+            for calc_op in calculation_operations:
+                op_dict = calc_op if isinstance(calc_op, dict) else {}
+                if op_dict.get("group_by"):
+                    effective_measure = op_dict.get("column")
+                    break
+
+        # Use derived aggregation type
+        effective_aggregation = agg_type if agg_type != "count" else (visualize_aggregation or "count")
+
+        try:
+            visualization_plan = VisualizationOperationPlan(
+                charts=[ChartSpec(
+                    type=resolved_chart_type,
+                    x=x_field,
+                    y=y_field,
+                    title=f"{resolved_chart_type.capitalize()} Chart",
+                    group_by=effective_group_by,
+                    measure=effective_measure,
+                    aggregation=effective_aggregation,
+                    output_field=y_field,
+                )]
+            )
+        except Exception:
+            # If we can't build a valid plan, disable visualization gracefully
+            needs_visualization = False
+            visualization_plan = None
+
     return PlanIntent(
         needs_cleaning=needs_cleaning,
         needs_filtering=needs_filtering,
@@ -723,6 +820,7 @@ def _canonical_intent_to_plan_intent(
         cleaning_plan=cleaning_plan,
         filter_plan=filter_plan,
         calculation_plan=calculation_plan,
+        visualization_plan=visualization_plan,
         reporting_title=intent.decision or None,
         sheet_name=None,
     )
@@ -898,6 +996,9 @@ def _canonical_filter_conditions(
             # Skip conditions with unresolved generic field references
             if not _can_resolve_field(condition.field):
                 continue
+            # Skip conditions with null value for operators that require one
+            if condition.value is None and condition.operator not in ("is_null", "is_not_null"):
+                continue
             result.append(
                 FilterCondition(
                     column=_resolve_single_grounded_column(condition.field),
@@ -910,6 +1011,8 @@ def _canonical_filter_conditions(
     inverted: list[FilterCondition] = []
     for condition in conditions:
         if not _can_resolve_field(condition.field):
+            continue
+        if condition.value is None and condition.operator not in ("is_null", "is_not_null"):
             continue
         operator = _invert_operator(condition.operator)
         inverted.append(

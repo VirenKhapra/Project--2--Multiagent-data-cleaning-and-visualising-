@@ -402,6 +402,16 @@ def _try_semantic_extraction(
             new_result = _repair_profile_grounded_references(new_result, dataframe_profile, submission_id=submission_id)
             new_result = _repair_null_row_cleanup(new_result, instruction=instruction)
             new_result = _repair_missing_clean_action(new_result, instruction=instruction)
+            new_result = _repair_missing_calculate_action(
+                new_result, instruction=instruction,
+                source_columns=source_columns, dataframe_profile=dataframe_profile,
+            )
+            # Enrich with visualization intent if trigger language detected
+            try:
+                from finflow_agent.planning.intent_enricher import enrich_intent_with_visualization
+                new_result = enrich_intent_with_visualization(new_result)
+            except ImportError:
+                pass  # Visualization module not available
             if isinstance(new_result, dict):
                 new_result["intent_hash"] = compute_intent_hash(new_result)
             logger.info("New pipeline extraction succeeded for: %s", instruction[:80])
@@ -768,6 +778,12 @@ def build_canonical_intent(
         dataframe_profile,
         submission_id=submission_id,
     )
+    # Enrich with visualization intent if trigger language detected
+    try:
+        from finflow_agent.planning.intent_enricher import enrich_intent_with_visualization
+        canonical_dict = enrich_intent_with_visualization(canonical_dict)
+    except ImportError:
+        pass
     if isinstance(canonical_dict, dict):
         canonical_dict["intent_hash"] = compute_intent_hash(canonical_dict)
     return canonical_dict
@@ -1558,6 +1574,9 @@ _RETURN_ROWS_PATTERNS = (
     r"\bget\s+(?:me\s+)?(?:the\s+)?rows\b",
     r"\breturn\s+(?:me\s+)?(?:the\s+)?data\b",
     r"\breturn\s+(?:me\s+)?(?:the\s+)?records\b",
+    r"\bshow\s+(?:it\s+)?as\s+a\s+(?:bar|pie|line|scatter)\s*(?:chart|graph)?\b",
+    r"\b(?:bar|pie|line|scatter)\s+chart\b",
+    r"\bvisuali[sz]e\b",
 )
 
 
@@ -1790,6 +1809,110 @@ def _repair_missing_clean_action(
     if not isinstance(evidence, list):
         evidence = []
     evidence.append("Injected clean action: user explicitly requested data cleaning.")
+    canonical_intent["evidence"] = evidence
+
+    return canonical_intent
+
+
+def _repair_missing_calculate_action(
+    canonical_intent: dict[str, Any],
+    *,
+    instruction: str,
+    source_columns: list[str] | None = None,
+    dataframe_profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Inject a calculate action if the user explicitly requests a calculation
+    but the LLM didn't produce one.
+
+    Detects patterns like:
+    - "calculate average X by Y"
+    - "calculate sum of X by Y"
+    - "average X by Y"
+    """
+    if not isinstance(canonical_intent, dict):
+        return canonical_intent
+
+    actions = canonical_intent.get("actions")
+    if not isinstance(actions, list):
+        return canonical_intent
+
+    # Check if calculate action already exists
+    for action in actions:
+        if isinstance(action, dict) and str(action.get("kind", "")).strip() == "calculate":
+            return canonical_intent
+
+    source_columns = source_columns or []
+    col_lower_map = {c.lower(): c for c in source_columns}
+
+    # Detect "calculate/compute average/sum/mean X by Y" patterns
+    calc_match = re.search(
+        r"\b(?:calculate|compute|find|get|show)\s+(?:the\s+)?(?P<agg>average|avg|mean|sum|total|count|median|min|max)"
+        r"(?:\s+(?:of\s+)?)?(?P<col>[\w\s]+?)\s+(?:by|per|grouped?\s+by|for\s+each)\s+(?P<group>[\w\s]+?)(?:\s*[,.]|\s+and\b|$)",
+        instruction,
+        re.IGNORECASE,
+    )
+    if not calc_match:
+        # Also try "average X by Y" without explicit "calculate"
+        calc_match = re.search(
+            r"\b(?P<agg>average|avg|mean|sum|total|count|median)\s+(?P<col>[\w\s]+?)\s+(?:by|per|grouped?\s+by|for\s+each)\s+(?P<group>[\w\s]+?)(?:\s*[,.]|\s+and\b|$)",
+            instruction,
+            re.IGNORECASE,
+        )
+
+    if not calc_match:
+        return canonical_intent
+
+    agg_name = calc_match.group("agg").strip().lower()
+    col_text = calc_match.group("col").strip().lower()
+    group_text = calc_match.group("group").strip().lower()
+
+    # Map aggregation names
+    agg_map = {"average": "mean", "avg": "mean", "mean": "mean", "sum": "sum", "total": "sum", "count": "count", "median": "median", "min": "min", "max": "max"}
+    op_type = f"group_{agg_map.get(agg_name, 'mean')}"
+
+    # Resolve column names against source_columns
+    def _resolve_col(text: str) -> str | None:
+        text = text.strip().replace(" ", "_")
+        if text in col_lower_map:
+            return col_lower_map[text]
+        # Try partial match
+        for col_lower, col_real in col_lower_map.items():
+            if text in col_lower or col_lower in text:
+                return col_real
+        # Try word-by-word
+        words = text.split("_")
+        for col_lower, col_real in col_lower_map.items():
+            if all(w in col_lower for w in words):
+                return col_real
+        return None
+
+    resolved_col = _resolve_col(col_text)
+    resolved_group = _resolve_col(group_text)
+
+    if not resolved_col or not resolved_group:
+        return canonical_intent
+
+    # Build the calculate action with structured operations
+    calc_action = {
+        "kind": "calculate",
+        "operations": [{
+            "type": op_type,
+            "column": resolved_col,
+            "group_by": [resolved_group],
+        }],
+    }
+    # Insert before visualize action if present, otherwise append
+    insert_idx = len(actions)
+    for i, action in enumerate(actions):
+        if isinstance(action, dict) and action.get("kind") == "visualize":
+            insert_idx = i
+            break
+    actions.insert(insert_idx, calc_action)
+
+    evidence = canonical_intent.get("evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    evidence.append(f"Injected calculate action: {op_type} of {resolved_col} by {resolved_group}.")
     canonical_intent["evidence"] = evidence
 
     return canonical_intent
