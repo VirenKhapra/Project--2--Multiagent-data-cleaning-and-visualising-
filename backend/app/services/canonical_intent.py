@@ -216,7 +216,7 @@ class CapabilitySnapshot(BaseModel):
 _ROLE_ALIASES: dict[str, set[str]] = {
     "merchant": {"merchant", "vendor", "provider", "payment method", "payment_method", "payment type", "gateway"},
     "status": {"status", "state", "payment status", "payment_status", "loan status", "loan_status"},
-    "gender": {"gender", "sex"},
+    "gender": {"gender", "sex", "male", "female", "man", "woman", "men", "women"},
     "marital_status": {"marital status", "marital_status", "relationship status", "relationship_status"},
     "education": {"education", "education level", "education_level", "degree", "qualification"},
     "transaction_id": {"transaction id", "transaction_id", "txn id", "txn_id", "invoice id", "invoice_id", "id", "identifier"},
@@ -397,6 +397,7 @@ def _try_semantic_extraction(
                 detected_types or {},
                 data_profile=data_profile,
             )
+            role_columns = infer_column_roles(source_columns)
             new_result = _repair_select_all_projection(new_result, instruction=instruction, source_columns=source_columns)
             new_result = _repair_profile_grounded_references(new_result, dataframe_profile, submission_id=submission_id)
             new_result = _repair_null_row_cleanup(new_result, instruction=instruction)
@@ -756,6 +757,10 @@ def build_canonical_intent(
     )
     canonical_dict = _repair_null_row_cleanup(
         canonical.model_dump(mode="json"),
+        instruction=instruction,
+    )
+    canonical_dict = _remove_spurious_analysis_filter_actions(
+        canonical_dict,
         instruction=instruction,
     )
     canonical_dict = _repair_profile_grounded_references(
@@ -1325,11 +1330,35 @@ def _extract_visualize_action(
         return None
     fields = _extract_requested_columns(normalized_prompt, source_columns, role_columns, dataframe_profile)
     chart_type = None
+    chart_type_aliases = {
+        "bar chart": "bar",
+        "line chart": "line",
+        "pie chart": "pie",
+        "scatter plot": "scatter",
+        "chart": "chart",
+        "plot": "plot",
+        "graph": "graph",
+    }
     for candidate in ("bar chart", "line chart", "pie chart", "scatter plot", "chart", "plot", "graph"):
         if candidate in normalized_prompt:
-            chart_type = candidate
+            chart_type = chart_type_aliases.get(candidate, candidate)
             break
     return VisualizeIntent(kind="visualize", chart_type=chart_type, fields=fields)
+
+
+def _suggest_calculation_output_column(aggregation_type: str, group_by: UnresolvedColumnReference) -> str | None:
+    base = group_by.resolved_column or group_by.raw_reference
+    base = normalize_semantic_name(base).replace(" ", "_")
+    if not base:
+        return None
+    suffix = {
+        "group_count": "count",
+        "group_sum": "sum",
+        "group_mean": "mean",
+    }.get(aggregation_type)
+    if not suffix:
+        return base
+    return f"{base}_{suffix}"
 
 
 def _extract_report_action(normalized_prompt: str) -> ReportIntent | None:
@@ -1374,6 +1403,80 @@ def _looks_like_output_format_request(normalized_prompt: str) -> bool:
 def _extract_output_format(normalized_prompt: str) -> str | None:
     match = _OUTPUT_FORMAT_RE.search(normalized_prompt)
     return match.group(1).lower() if match else None
+
+
+def _remove_spurious_analysis_filter_actions(
+    canonical_intent: dict[str, Any],
+    *,
+    instruction: str,
+) -> dict[str, Any]:
+    if not isinstance(canonical_intent, dict):
+        return canonical_intent
+
+    normalized_prompt = _normalize_text(instruction)
+    if not re.search(r"\b(?:chart|plot|graph|visuali[sz]e|ratio|share|distribution|breakdown|percentage|percent)\b", normalized_prompt):
+        return canonical_intent
+
+    actions = canonical_intent.get("actions")
+    if not isinstance(actions, list):
+        return canonical_intent
+
+    retained_actions: list[Any] = []
+    removed_any = False
+    for action in actions:
+        if not isinstance(action, dict) or str(action.get("kind", "")).strip() != "filter_rows":
+            retained_actions.append(action)
+            continue
+        if _filter_action_looks_spurious_for_analysis(action):
+            removed_any = True
+            continue
+        retained_actions.append(action)
+
+    if not removed_any:
+        return canonical_intent
+
+    canonical_intent["actions"] = retained_actions
+    canonical_intent["decision"] = _build_decision_summary(retained_actions)
+
+    evidence = canonical_intent.get("evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    evidence.append("Removed a spurious filter interpretation from visualization or ratio language.")
+    canonical_intent["evidence"] = _dedupe_preserve_order(evidence)
+
+    repair_notes = canonical_intent.get("repair_notes")
+    if not isinstance(repair_notes, list):
+        repair_notes = []
+    repair_notes.append("Discarded a filter-like parse artifact from a chart or ratio request.")
+    canonical_intent["repair_notes"] = _dedupe_preserve_order(repair_notes)
+
+    if str(canonical_intent.get("resolution_status", "")).strip() in {"needs_clarification", "unsupported"}:
+        canonical_intent["resolution_status"] = "repaired"
+
+    return canonical_intent
+
+
+def _filter_action_looks_spurious_for_analysis(action: dict[str, Any]) -> bool:
+    if str(action.get("kind", "")).strip() != "filter_rows":
+        return False
+    conditions = action.get("conditions", [])
+    if not isinstance(conditions, list):
+        return False
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            continue
+        field = condition.get("field")
+        field_raw = ""
+        if isinstance(field, dict):
+            field_raw = _normalize_text(str(field.get("raw_reference", "")))
+        value_text = _normalize_text(str(condition.get("value", "")))
+        if field_raw in {"chart", "plot", "graph", "pie chart", "bar chart", "line chart", "scatter plot"}:
+            return True
+        if re.search(r"\b(?:ratio|share|distribution|breakdown|percentage|percent)\b", value_text):
+            return True
+        if re.search(r"\b(?:chart|plot|graph)\b", value_text):
+            return True
+    return False
 
 
 def _build_dataframe_profile(

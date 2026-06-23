@@ -55,6 +55,7 @@ from finflow_agent.operations.schemas import (
     NormalizeColumnNamesOperation,
     RemoveEmptyRowsOperation,
     TrimWhitespaceOperation,
+    VisualizationOperationPlan,
 )
 from finflow_agent.planning.canonical_intent import (
     CANONICAL_INTENT_SCHEMA_VERSION,
@@ -461,12 +462,65 @@ def compile_intent_to_plan(
     #    supplied a plan; the missing-plan branch was already raised in
     #    step 0. The flag is read via ``get_enable_visualization`` so test
     #    fixtures can monkeypatch it deterministically.
+    #
+    #    When the visualization plan contains charts that declare a
+    #    ``group_by`` field, the compiler inserts a ``calculation_agent``
+    #    step (using group_count/group_sum/group_mean) BEFORE the
+    #    visualization step so the visualization agent receives
+    #    pre-aggregated data (zero-calculation principle).
     # ------------------------------------------------------------------
     if intent.needs_visualization and intent.visualization_plan is not None:
         if not get_enable_visualization():
             raise VisualizationDisabledError(
                 VISUALIZATION_REQUESTED_BUT_DISABLED_MESSAGE
             )
+
+        # Check if any chart in the plan requires data aggregation
+        needs_calc_step = False
+        for chart in intent.visualization_plan.charts:
+            if chart.group_by:
+                needs_calc_step = True
+                break
+
+        if needs_calc_step:
+            # Build calculation operations for charts that need aggregation
+            calc_operations: List[Dict[str, Any]] = []
+            for chart in intent.visualization_plan.charts:
+                if not chart.group_by:
+                    continue
+                # Determine operation type from chart's aggregation field
+                if chart.aggregation == "sum":
+                    op_type = "group_sum"
+                elif chart.aggregation == "mean":
+                    op_type = "group_mean"
+                else:
+                    op_type = "group_count"
+
+                output_col = chart.output_field or "record_count"
+                # For group_count, the column is the group_by column itself
+                # (count doesn't need a specific measure column)
+                measure_col = chart.measure or chart.group_by[0]
+
+                calc_operations.append({
+                    "type": op_type,
+                    "column": measure_col,
+                    "group_by": list(chart.group_by),
+                    "output_column": output_col,
+                })
+
+            # Insert calculation_agent step
+            steps.append(
+                PlanStep(
+                    step_id="calc_viz",
+                    agent="calculation_agent",
+                    params={"operations": calc_operations},
+                    depends_on=[steps[-1].step_id],
+                    input_from=[last_df_key],
+                    output_key="df_calc_viz",
+                )
+            )
+            last_df_key = "df_calc_viz"
+
         steps.append(
             PlanStep(
                 step_id="visualize",
@@ -629,7 +683,12 @@ def _canonical_intent_to_plan_intent(
             continue
         if isinstance(action, VisualizeIntent):
             needs_visualization = True
-            raise ValueError("Canonical visualize intent is not supported by the current compiler.")
+            visualize_chart_type = action.chart_type
+            visualize_group_by = action.group_by
+            visualize_aggregation = action.aggregation
+            visualize_measure = action.measure
+            visualize_output_field = action.output_field
+            continue
         if isinstance(action, ReportIntent):
             continue
 
@@ -708,6 +767,69 @@ def _source_columns_from_intent(intent: CanonicalIntent, resolved_file_path: str
         return [str(column).strip() for column in frame.columns if str(column).strip()]
     except Exception:
         return []
+
+
+def _derive_group_by_from_profile(intent: CanonicalIntent) -> list[str] | None:
+    """Derive a default group_by column from the dataframe profile and prompt.
+
+    Strategy:
+    1. First, try to find a column name that appears in the user's prompt
+       (e.g., "gender" in "show male to female ratio as a pie chart").
+    2. If no prompt match, look for known low-cardinality categorical columns
+       (gender, sex, status, type, etc.) preferring exact matches over suffix matches.
+    """
+    source_columns = intent.dataframe_profile.get("source_columns", [])
+    if not source_columns:
+        return None
+
+    prompt = (intent.original_prompt or "").lower()
+
+    # Strategy 1: Find columns explicitly mentioned in the prompt
+    # Also check common synonyms (male/female → gender, etc.)
+    prompt_column_hints = {
+        "male": "gender", "female": "gender", "gender": "gender",
+        "sex": "sex", "men": "gender", "women": "gender",
+    }
+
+    # Direct column name match in prompt
+    for col in source_columns:
+        col_lower = str(col).lower().strip()
+        if col_lower in prompt:
+            return [str(col).strip()]
+
+    # Synonym-based match
+    for keyword, target_col in prompt_column_hints.items():
+        if keyword in prompt:
+            # Find the actual column that matches the target
+            for col in source_columns:
+                if str(col).lower().strip() == target_col:
+                    return [str(col).strip()]
+
+    # Strategy 2: Known low-cardinality categorical columns (exact match first)
+    # Prioritize columns that are typically binary/few categories
+    high_priority = {"gender", "sex", "status", "type", "class", "tier", "level"}
+    low_priority = {"category", "region", "segment", "group", "department",
+                    "country", "city", "state", "brand", "product", "channel"}
+
+    for col in source_columns:
+        col_lower = str(col).lower().strip()
+        if col_lower in high_priority:
+            return [str(col).strip()]
+
+    for col in source_columns:
+        col_lower = str(col).lower().strip()
+        if col_lower in low_priority:
+            return [str(col).strip()]
+
+    # Strategy 3: Suffix/prefix patterns (less reliable)
+    all_hints = high_priority | low_priority
+    for col in source_columns:
+        col_lower = str(col).lower().strip()
+        for hint in high_priority:
+            if col_lower.endswith(f"_{hint}") or col_lower.startswith(f"{hint}_"):
+                return [str(col).strip()]
+
+    return None
 
 
 def _resolve_requested_columns(fields: list[UnresolvedColumnReference]) -> list[str]:
