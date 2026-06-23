@@ -349,6 +349,47 @@ def calc_quarterly_count(df: pd.DataFrame, op: CalculationOperation) -> Dict[str
     return {"df": grouped}
 
 
+def calc_cross_tab_sum(df: pd.DataFrame, op: CalculationOperation) -> Dict[str, Any]:
+    """Cross-tabulation: sum of a measure grouped by TWO dimensions.
+
+    Produces a flat table with columns: [group_by[0], group_by[1], output_column].
+    Used for grouped bar charts (e.g., total income by education × gender).
+    """
+    if not op.group_by or len(op.group_by) < 2:
+        raise OperationExecutionError("cross_tab_sum requires at least 2 group_by columns.")
+    _check_numeric(df, op.column)
+
+    out_col = op.output_column or f"sum_{op.column}"
+    grouped = df.groupby(list(op.group_by), as_index=False)[op.column].sum()
+    grouped.rename(columns={op.column: out_col}, inplace=True)
+    grouped[out_col] = _round_series_if_currency(grouped[out_col], out_col)
+    return {"df": grouped}
+
+
+def calc_cross_tab_mean(df: pd.DataFrame, op: CalculationOperation) -> Dict[str, Any]:
+    """Cross-tabulation: mean of a measure grouped by TWO dimensions."""
+    if not op.group_by or len(op.group_by) < 2:
+        raise OperationExecutionError("cross_tab_mean requires at least 2 group_by columns.")
+    _check_numeric(df, op.column)
+
+    out_col = op.output_column or f"mean_{op.column}"
+    grouped = df.groupby(list(op.group_by), as_index=False)[op.column].mean()
+    grouped.rename(columns={op.column: out_col}, inplace=True)
+    grouped[out_col] = _round_series_if_currency(grouped[out_col], out_col)
+    return {"df": grouped}
+
+
+def calc_cross_tab_count(df: pd.DataFrame, op: CalculationOperation) -> Dict[str, Any]:
+    """Cross-tabulation: count grouped by TWO dimensions."""
+    if not op.group_by or len(op.group_by) < 2:
+        raise OperationExecutionError("cross_tab_count requires at least 2 group_by columns.")
+
+    out_col = op.output_column or f"count_{op.column}"
+    grouped = df.groupby(list(op.group_by), as_index=False).size()
+    grouped.rename(columns={"size": out_col}, inplace=True)
+    return {"df": grouped}
+
+
 CALCULATION_HANDLERS = {
     "sum": calc_sum,
     "mean": calc_mean,
@@ -371,4 +412,7 @@ CALCULATION_HANDLERS = {
     "quarterly_sum": calc_quarterly_sum,
     "quarterly_mean": calc_quarterly_mean,
     "quarterly_count": calc_quarterly_count,
+    "cross_tab_sum": calc_cross_tab_sum,
+    "cross_tab_mean": calc_cross_tab_mean,
+    "cross_tab_count": calc_cross_tab_count,
 }

@@ -45,18 +45,24 @@ from finflow_agent.contract_registry import (
     UnmappedSemanticTypeError,
 )
 from finflow_agent.operations.schemas import (
+    AbsoluteValueOperation,
     CalculationOperation,
     CalculationOperationPlan,
+    ChartSpec,
     CleaningOperationPlan,
     DropDuplicatesOperation,
     DropNullsOperation,
+    FillNullsOperation,
     FilterCondition,
     FilterOperationPlan,
     NormalizeColumnNamesOperation,
+    NormalizeDateOperation,
+    NormalizeTextCaseOperation,
+    RemoveCommasFromNumbersOperation,
     RemoveEmptyRowsOperation,
+    StripCurrencySymbolsOperation,
     TrimWhitespaceOperation,
     VisualizationOperationPlan,
-    ChartSpec,
 )
 from finflow_agent.planning.canonical_intent import (
     CANONICAL_INTENT_SCHEMA_VERSION,
@@ -121,6 +127,10 @@ CANONICAL_OUTPUT_KEYS: frozenset[str] = frozenset(
         "df_filtered",
         "df_calculated",
         "df_calc_viz",
+        "df_calc_viz_1",
+        "df_calc_viz_2",
+        "df_calc_viz_3",
+        "df_calc_viz_4",
         "df_visualized",
         "report_output",
     }
@@ -470,6 +480,7 @@ def compile_intent_to_plan(
     #    step (using group_count/group_sum/group_mean) BEFORE the
     #    visualization step so the visualization agent receives
     #    pre-aggregated data (zero-calculation principle).
+    #    Multi-chart: each chart gets its own calc step if needed.
     # ------------------------------------------------------------------
     if intent.needs_visualization and intent.visualization_plan is not None:
         if not get_enable_visualization():
@@ -477,57 +488,49 @@ def compile_intent_to_plan(
                 VISUALIZATION_REQUESTED_BUT_DISABLED_MESSAGE
             )
 
-        # Check if any chart in the plan requires data aggregation
-        needs_calc_step = False
-        for chart in intent.visualization_plan.charts:
-            if chart.group_by:
-                needs_calc_step = True
-                break
-
-        # Skip calc_viz if a calculate step already produced the grouped data
-        # (avoids double-aggregating when calculate and visualize use the same grouping)
+        # Skip all calc_viz steps if a calculate step already produced grouped data
         has_prior_calc = any(s.step_id == "calculate" for s in steps)
-        if has_prior_calc:
-            needs_calc_step = False
 
-        if needs_calc_step:
-            # Build calculation operations for charts that need aggregation
-            calc_operations: List[Dict[str, Any]] = []
-            for chart in intent.visualization_plan.charts:
+        # Build independent calc steps for each chart that needs aggregation
+        if not has_prior_calc:
+            for idx, chart in enumerate(intent.visualization_plan.charts):
                 if not chart.group_by:
                     continue
-                # Determine operation type from chart's aggregation field
+
+                # Determine operation type
                 if chart.aggregation == "sum":
-                    op_type = "group_sum"
+                    op_type = "group_sum" if len(chart.group_by) == 1 else "cross_tab_sum"
                 elif chart.aggregation == "mean":
-                    op_type = "group_mean"
+                    op_type = "group_mean" if len(chart.group_by) == 1 else "cross_tab_mean"
                 else:
-                    op_type = "group_count"
+                    op_type = "group_count" if len(chart.group_by) == 1 else "cross_tab_count"
 
                 output_col = chart.output_field or "record_count"
-                # For group_count, the column is the group_by column itself
-                # (count doesn't need a specific measure column)
                 measure_col = chart.measure or chart.group_by[0]
 
-                calc_operations.append({
-                    "type": op_type,
-                    "column": measure_col,
-                    "group_by": list(chart.group_by),
-                    "output_column": output_col,
-                })
+                calc_step_id = f"calc_viz_{idx}" if idx > 0 else "calc_viz"
+                calc_output_key = f"df_calc_viz_{idx}" if idx > 0 else "df_calc_viz"
 
-            # Insert calculation_agent step
-            steps.append(
-                PlanStep(
-                    step_id="calc_viz",
-                    agent="calculation_agent",
-                    params={"operations": calc_operations},
-                    depends_on=[steps[-1].step_id],
-                    input_from=[last_df_key],
-                    output_key="df_calc_viz",
+                steps.append(
+                    PlanStep(
+                        step_id=calc_step_id,
+                        agent="calculation_agent",
+                        params={"operations": [{
+                            "type": op_type,
+                            "column": measure_col,
+                            "group_by": list(chart.group_by),
+                            "output_column": output_col,
+                        }]},
+                        depends_on=[steps[-1].step_id] if idx == 0 else [steps[-1].step_id],
+                        input_from=[last_df_key],
+                        output_key=calc_output_key,
+                    )
                 )
-            )
-            last_df_key = "df_calc_viz"
+            # Use last calc step output for visualization
+            if any(s.step_id.startswith("calc_viz") for s in steps):
+                last_df_key = next(
+                    s.output_key for s in reversed(steps) if s.step_id.startswith("calc_viz")
+                )
 
         steps.append(
             PlanStep(
@@ -649,6 +652,7 @@ def _canonical_intent_to_plan_intent(
     visualize_aggregation: str | None = None
     visualize_measure: str | None = None
     visualize_output_field: str | None = None
+    visualize_intents: list[dict] = []
 
     for action in intent.actions:
         # Resolve the semantic operation type to a canonical action kind via
@@ -697,6 +701,15 @@ def _canonical_intent_to_plan_intent(
             continue
         if isinstance(action, VisualizeIntent):
             needs_visualization = True
+            # Collect all visualization intents for multi-chart support
+            visualize_intents.append({
+                "chart_type": action.chart_type,
+                "group_by": action.group_by,
+                "aggregation": action.aggregation,
+                "measure": action.measure,
+                "output_field": action.output_field,
+            })
+            # Keep last one as fallback for single-chart variables
             visualize_chart_type = action.chart_type
             visualize_group_by = action.group_by
             visualize_aggregation = action.aggregation
@@ -731,71 +744,79 @@ def _canonical_intent_to_plan_intent(
     # Build visualization plan from extracted chart fields
     visualization_plan: VisualizationOperationPlan | None = None
     if needs_visualization:
-        chart_type = visualize_chart_type or "bar"
-        # Normalize chart type to supported values
         chart_type_map = {"pie": "pie", "bar": "bar", "line": "line", "scatter": "scatter", "histogram": "bar", "area": "area"}
-        resolved_chart_type = chart_type_map.get(chart_type.lower(), "bar")
+        charts_list: List[ChartSpec] = []
 
-        # Determine x and y fields from context
-        x_field = ""
-        y_field = ""
-        agg_type = visualize_aggregation or "count"
+        # Build one ChartSpec per visualize intent
+        intents_to_process = visualize_intents if visualize_intents else [{
+            "chart_type": visualize_chart_type,
+            "group_by": visualize_group_by,
+            "aggregation": visualize_aggregation,
+            "measure": visualize_measure,
+            "output_field": visualize_output_field,
+        }]
 
-        # Priority 1: Use explicit visualization group_by/measure
-        if visualize_group_by and isinstance(visualize_group_by, list) and visualize_group_by:
-            x_field = visualize_group_by[0]
-        if visualize_measure:
-            y_field = visualize_measure
+        for viz_intent in intents_to_process:
+            chart_type = viz_intent.get("chart_type") or "bar"
+            resolved_chart_type = chart_type_map.get(chart_type.lower(), "bar")
+            viz_group_by = viz_intent.get("group_by")
+            viz_measure = viz_intent.get("measure")
+            viz_aggregation = viz_intent.get("aggregation")
+            viz_output_field = viz_intent.get("output_field")
 
-        # Priority 2: Derive from calculation operations if they have group_by
-        if not x_field and calculation_operations:
-            for calc_op in calculation_operations:
-                op_dict = calc_op if isinstance(calc_op, dict) else {}
-                gb = op_dict.get("group_by")
-                if gb and isinstance(gb, list) and gb:
-                    x_field = gb[0]
-                    if not y_field:
-                        col = op_dict.get("output_column") or op_dict.get("column", "")
-                        op_t = op_dict.get("type", "")
-                        y_field = op_dict.get("output_column") or f"{op_t.replace('group_', '')}_{col}"
-                        agg_type = op_t.replace("group_", "") if "group_" in op_t else op_t
-                    break
+            # Determine x and y fields
+            x_field = ""
+            y_field = ""
+            agg_type = viz_aggregation or "count"
 
-        if not y_field:
-            y_field = visualize_output_field or "record_count"
+            if viz_group_by and isinstance(viz_group_by, list) and viz_group_by:
+                x_field = viz_group_by[0]
+            if viz_measure:
+                y_field = viz_measure
 
-        # Use source_columns as fallback for x if not specified
-        if not x_field and source_columns:
-            # Pick a likely categorical column
-            for col in source_columns:
-                col_lower = col.lower()
-                if any(kw in col_lower for kw in ["gender", "category", "type", "status", "class", "department", "group"]):
-                    x_field = col
-                    break
-            if not x_field:
-                x_field = source_columns[0]
+            # Derive from calculation operations
+            if not x_field and calculation_operations:
+                for calc_op in calculation_operations:
+                    op_dict = calc_op if isinstance(calc_op, dict) else {}
+                    gb = op_dict.get("group_by")
+                    if gb and isinstance(gb, list) and gb:
+                        x_field = gb[0]
+                        if not y_field:
+                            op_t = op_dict.get("type", "")
+                            y_field = op_dict.get("output_column") or f"{op_t.replace('group_', '')}_{op_dict.get('column', '')}"
+                            agg_type = op_t.replace("group_", "") if "group_" in op_t else op_t
+                        break
 
-        # For aggregation charts (pie, bar), ensure group_by is set
-        # so the pre-aggregation step is triggered
-        effective_group_by = visualize_group_by
-        if not effective_group_by and x_field and resolved_chart_type in ("pie", "bar"):
-            effective_group_by = [x_field]
+            if not y_field:
+                y_field = viz_output_field or "record_count"
 
-        # Determine the measure column for the aggregation step
-        effective_measure = visualize_measure
-        if not effective_measure and calculation_operations:
-            for calc_op in calculation_operations:
-                op_dict = calc_op if isinstance(calc_op, dict) else {}
-                if op_dict.get("group_by"):
-                    effective_measure = op_dict.get("column")
-                    break
+            # Fallback x_field from source columns
+            if not x_field and source_columns:
+                for col in source_columns:
+                    col_lower = col.lower()
+                    if any(kw in col_lower for kw in ["gender", "category", "type", "status", "class", "department", "group", "education"]):
+                        x_field = col
+                        break
+                if not x_field:
+                    x_field = source_columns[0]
 
-        # Use derived aggregation type
-        effective_aggregation = agg_type if agg_type != "count" else (visualize_aggregation or "count")
+            # Ensure group_by for aggregation charts
+            effective_group_by = viz_group_by
+            if not effective_group_by and x_field and resolved_chart_type in ("pie", "bar"):
+                effective_group_by = [x_field]
 
-        try:
-            visualization_plan = VisualizationOperationPlan(
-                charts=[ChartSpec(
+            effective_measure = viz_measure
+            if not effective_measure and calculation_operations:
+                for calc_op in calculation_operations:
+                    op_dict = calc_op if isinstance(calc_op, dict) else {}
+                    if op_dict.get("group_by"):
+                        effective_measure = op_dict.get("column")
+                        break
+
+            effective_aggregation = agg_type if agg_type != "count" else (viz_aggregation or "count")
+
+            try:
+                charts_list.append(ChartSpec(
                     type=resolved_chart_type,
                     x=x_field,
                     y=y_field,
@@ -804,10 +825,13 @@ def _canonical_intent_to_plan_intent(
                     measure=effective_measure,
                     aggregation=effective_aggregation,
                     output_field=y_field,
-                )]
-            )
-        except Exception:
-            # If we can't build a valid plan, disable visualization gracefully
+                ))
+            except Exception:
+                continue
+
+        if charts_list:
+            visualization_plan = VisualizationOperationPlan(charts=charts_list)
+        else:
             needs_visualization = False
             visualization_plan = None
 
@@ -971,7 +995,7 @@ def _build_cleaning_plan(action: CleanIntent) -> CleaningOperationPlan:
             operations.append(TrimWhitespaceOperation(columns="__all_string_columns__"))
         elif name == "normalize_column_names":
             operations.append(NormalizeColumnNamesOperation(style="snake_case"))
-        elif name == "drop_duplicates":
+        elif name in ("drop_duplicates", "deduplicate"):
             operations.append(DropDuplicatesOperation(subset=None, keep="first"))
         elif name == "drop_nulls":
             columns = operation.parameters.get("columns") if isinstance(operation.parameters, dict) else None
@@ -981,8 +1005,42 @@ def _build_cleaning_plan(action: CleanIntent) -> CleaningOperationPlan:
             operations.append(DropNullsOperation(columns=columns, how=how if how in {"any", "all"} else "any"))
         elif name == "remove_empty_rows":
             operations.append(RemoveEmptyRowsOperation())
+        elif name == "absolute_value":
+            columns = "__all_numeric_columns__"
+            if isinstance(operation.parameters, dict) and operation.parameters.get("columns"):
+                columns = operation.parameters["columns"]
+            operations.append(AbsoluteValueOperation(columns=columns))
+        elif name == "fill_nulls":
+            params = operation.parameters if isinstance(operation.parameters, dict) else {}
+            operations.append(FillNullsOperation(
+                column=params.get("column", "__all__"),
+                strategy=params.get("strategy", "constant"),
+                value=params.get("value", 0),
+            ))
+        elif name == "normalize_date":
+            operations.append(NormalizeDateOperation(
+                column=operation.parameters.get("column", "__all__") if isinstance(operation.parameters, dict) else "__all__",
+                target_format="%Y-%m-%d",
+            ))
+        elif name == "normalize_text_case":
+            operations.append(NormalizeTextCaseOperation(
+                columns="__all_string_columns__",
+                case="lower",
+            ))
+        elif name == "strip_currency_symbols":
+            operations.append(StripCurrencySymbolsOperation(
+                columns="__all_string_columns__",
+            ))
+        elif name == "remove_commas_from_numbers":
+            operations.append(RemoveCommasFromNumbersOperation(
+                columns="__all_string_columns__",
+            ))
+        elif name == "normalize_categorical_values":
+            # Pass through to the handler — it operates on all string columns by default
+            continue  # No schema model needed — handled dynamically by the handler
         else:
-            raise ValueError(f"Unsupported canonical cleaning operation: {name!r}")
+            # Skip unknown operations gracefully instead of crashing
+            continue
     return CleaningOperationPlan(operations=operations)
 
 

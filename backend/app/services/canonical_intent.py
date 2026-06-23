@@ -402,6 +402,8 @@ def _try_semantic_extraction(
             new_result = _repair_profile_grounded_references(new_result, dataframe_profile, submission_id=submission_id)
             new_result = _repair_null_row_cleanup(new_result, instruction=instruction)
             new_result = _repair_missing_clean_action(new_result, instruction=instruction)
+            new_result = _repair_missing_clean_operations(new_result, instruction=instruction)
+            new_result = _repair_filter_mode(new_result, instruction=instruction)
             new_result = _repair_missing_calculate_action(
                 new_result, instruction=instruction,
                 source_columns=source_columns, dataframe_profile=dataframe_profile,
@@ -926,14 +928,29 @@ def build_action_schema_from_canonical_intent(
 def _extract_clean_action(normalized_prompt: str) -> CleanIntent | None:
     if not _CLEAN_RE.search(normalized_prompt):
         if not _looks_like_null_row_cleanup(normalized_prompt):
-            return None
+            # Check for specific cleaning keywords even without "clean" mentioned
+            if not re.search(
+                r"\b(?:remove\s+(?:negative|duplicat|empty|null|missing|blank)|"
+                r"fill\s+(?:missing|null|empty|blank)|"
+                r"strip|convert|normalize|standardize)\b",
+                normalized_prompt, re.IGNORECASE
+            ):
+                return None
     operations = []
-    if "deduplicate" in normalized_prompt or "duplicate" in normalized_prompt:
-        operations.append(CleaningIntentOperation(name="deduplicate"))
-    if "trim" in normalized_prompt or "whitespace" in normalized_prompt:
+
+    # Deduplication
+    if re.search(r"\b(?:deduplicate|de-duplicate|remove\s+duplicate|drop\s+duplicate)\b", normalized_prompt, re.IGNORECASE):
+        operations.append(CleaningIntentOperation(name="drop_duplicates"))
+
+    # Trim whitespace
+    if re.search(r"\b(?:trim|whitespace|strip\s+spaces?)\b", normalized_prompt, re.IGNORECASE):
         operations.append(CleaningIntentOperation(name="trim_whitespace"))
-    if "normalize" in normalized_prompt or "normalise" in normalized_prompt or "standardize" in normalized_prompt or "standardise" in normalized_prompt:
-        operations.append(CleaningIntentOperation(name="normalize_values"))
+
+    # Normalize/standardize
+    if re.search(r"\b(?:normalize|normalise|standardize|standardise)\s+(?:column\s+)?names?\b", normalized_prompt, re.IGNORECASE):
+        operations.append(CleaningIntentOperation(name="normalize_column_names"))
+
+    # Drop nulls/missing
     if _looks_like_null_row_cleanup(normalized_prompt):
         operations.append(
             CleaningIntentOperation(
@@ -941,6 +958,37 @@ def _extract_clean_action(normalized_prompt: str) -> CleanIntent | None:
                 parameters={"columns": None, "how": "any"},
             )
         )
+
+    # Fill nulls/missing
+    if re.search(r"\b(?:fill|impute|replace)\s+(?:missing|null|empty|blank|nan)\b", normalized_prompt, re.IGNORECASE):
+        operations.append(CleaningIntentOperation(name="fill_nulls", parameters={"value": 0}))
+
+    # Remove negative signs / absolute value
+    if re.search(r"\b(?:remove|strip|delete|drop)\s+(?:the\s+)?(?:negative\s+(?:sign|value|number)|minus\s+sign)\b", normalized_prompt, re.IGNORECASE):
+        operations.append(CleaningIntentOperation(name="absolute_value", parameters={"columns": "__all_numeric_columns__"}))
+    elif re.search(r"\b(?:make\s+(?:all\s+)?(?:values?\s+)?positive|absolute\s+value|remove\s+negatives?)\b", normalized_prompt, re.IGNORECASE):
+        operations.append(CleaningIntentOperation(name="absolute_value", parameters={"columns": "__all_numeric_columns__"}))
+
+    # Strip currency symbols
+    if re.search(r"\b(?:strip|remove)\s+(?:currency|dollar|rupee)\s*(?:symbol|sign)?\b", normalized_prompt, re.IGNORECASE):
+        operations.append(CleaningIntentOperation(name="strip_currency_symbols"))
+
+    # Remove commas from numbers
+    if re.search(r"\b(?:remove|strip)\s+commas?\s+(?:from\s+)?(?:number|numeric|amount)\b", normalized_prompt, re.IGNORECASE):
+        operations.append(CleaningIntentOperation(name="remove_commas_from_numbers"))
+
+    # Normalize dates
+    if re.search(r"\b(?:normalize|standardize|fix|convert)\s+(?:the\s+)?date\b", normalized_prompt, re.IGNORECASE):
+        operations.append(CleaningIntentOperation(name="normalize_date"))
+
+    # Normalize text case
+    if re.search(r"\b(?:lowercase|uppercase|title\s*case|normalize\s+(?:text\s+)?case)\b", normalized_prompt, re.IGNORECASE):
+        operations.append(CleaningIntentOperation(name="normalize_text_case"))
+
+    # Remove empty rows/columns
+    if re.search(r"\b(?:remove|drop|delete)\s+(?:empty|blank)\s+(?:row|column)\b", normalized_prompt, re.IGNORECASE):
+        operations.append(CleaningIntentOperation(name="remove_empty_rows"))
+
     return CleanIntent(kind="clean", mode="explicit" if operations else "safe_default", operations=operations)
 
 
@@ -1774,6 +1822,48 @@ def _repair_profile_grounded_references(
     return canonical_intent
 
 
+def _repair_filter_mode(
+    canonical_intent: dict[str, Any],
+    *,
+    instruction: str,
+) -> dict[str, Any]:
+    """Fix filter mode when user says 'remove/drop/delete rows' but LLM produced mode='keep'.
+
+    When the instruction explicitly says to remove/drop/delete rows matching a condition,
+    the filter mode should be 'drop' (remove matching rows). If the LLM produced 'keep',
+    flip it.
+    """
+    if not isinstance(canonical_intent, dict):
+        return canonical_intent
+
+    normalized = _normalize_text(instruction)
+
+    # Detect "remove/drop/delete rows/records/entries WHERE condition" language
+    is_removal = bool(re.search(
+        r"\b(?:remove|drop|delete|exclude|discard|filter\s+out)\s+"
+        r"(?:the\s+)?(?:rows?|records?|entries?|field|data|values?)?\s*"
+        r"(?:which|that|where|having|with|containing|contains)",
+        normalized,
+        re.IGNORECASE,
+    ))
+
+    if not is_removal:
+        return canonical_intent
+
+    actions = canonical_intent.get("actions")
+    if not isinstance(actions, list):
+        return canonical_intent
+
+    for action in actions:
+        if not isinstance(action, dict) or action.get("kind") != "filter_rows":
+            continue
+        # Only flip if mode is currently "keep" — user wants removal
+        if action.get("mode") == "keep":
+            action["mode"] = "drop"
+
+    return canonical_intent
+
+
 def _repair_missing_clean_action(
     canonical_intent: dict[str, Any],
     *,
@@ -1810,6 +1900,70 @@ def _repair_missing_clean_action(
         evidence = []
     evidence.append("Injected clean action: user explicitly requested data cleaning.")
     canonical_intent["evidence"] = evidence
+
+    return canonical_intent
+
+
+def _repair_missing_clean_operations(
+    canonical_intent: dict[str, Any],
+    *,
+    instruction: str,
+) -> dict[str, Any]:
+    """Inject specific cleaning operations that were mentioned in the instruction
+    but not captured in the existing clean action's operations list."""
+    if not isinstance(canonical_intent, dict):
+        return canonical_intent
+
+    normalized = _normalize_text(instruction)
+    actions = canonical_intent.get("actions")
+    if not isinstance(actions, list):
+        return canonical_intent
+
+    # Find existing clean action
+    clean_action = None
+    for action in actions:
+        if isinstance(action, dict) and action.get("kind") == "clean":
+            clean_action = action
+            break
+
+    if clean_action is None:
+        return canonical_intent
+
+    operations = clean_action.get("operations")
+    if not isinstance(operations, list):
+        operations = []
+        clean_action["operations"] = operations
+
+    existing_names = {op.get("name") for op in operations if isinstance(op, dict)}
+
+    # Check for "remove negative signs" / "absolute value"
+    if "absolute_value" not in existing_names:
+        if re.search(
+            r"\b(?:remove|strip|delete|drop)\s+(?:the\s+)?(?:negative\s+(?:sign|value|number)|minus\s+sign)\b",
+            normalized, re.IGNORECASE,
+        ) or re.search(
+            r"\b(?:make\s+(?:all\s+)?(?:values?\s+)?positive|absolute\s+value|remove\s+negatives?)\b",
+            normalized, re.IGNORECASE,
+        ):
+            operations.append({"name": "absolute_value", "parameters": {"columns": "__all_numeric_columns__"}})
+
+    # Check for "remove duplicates"
+    if "drop_duplicates" not in existing_names:
+        if re.search(r"\b(?:remove|drop|delete)\s+(?:the\s+)?duplicat", normalized, re.IGNORECASE):
+            operations.append({"name": "drop_duplicates", "parameters": {}})
+
+    # Check for "strip currency symbols"
+    if "strip_currency_symbols" not in existing_names:
+        if re.search(r"\b(?:strip|remove)\s+(?:the\s+)?(?:currency|dollar|rupee)\s*(?:symbol|sign)?\b", normalized, re.IGNORECASE):
+            operations.append({"name": "strip_currency_symbols", "parameters": {}})
+
+    # Check for "normalize values" / "normalize inconsistent values"
+    if "normalize_categorical_values" not in existing_names:
+        if re.search(r"\b(?:normalize|standardize)\s+(?:inconsistent\s+)?(?:values?|categories|categorical)\b", normalized, re.IGNORECASE):
+            operations.append({"name": "normalize_categorical_values", "parameters": {"columns": "__all_string_columns__"}})
+
+    if operations:
+        clean_action["mode"] = "explicit"
 
     return canonical_intent
 
@@ -1918,6 +2072,75 @@ def _repair_missing_calculate_action(
     return canonical_intent
 
 
+def _extract_null_drop_columns(instruction: str, canonical_intent: dict) -> list[str] | None:
+    """Extract specific column names for null dropping from the instruction.
+
+    Detects patterns like:
+    - "remove rows with missing values for education or credit score column"
+    - "drop nulls in age and income columns"
+    - "remove rows having null in gender column"
+
+    Returns a list of column names if specific columns are mentioned,
+    or None to drop nulls across all columns.
+    """
+    # Pattern: "missing/null values for/in <col1> or/and <col2> column(s)"
+    col_match = re.search(
+        r"\b(?:missing|null|empty|blank)\s+(?:values?\s+)?(?:for|in|from|of)\s+"
+        r"(?:any\s+(?:these|those|the)\s+)?"
+        r"(?P<cols>.+?)\s*(?:column|field|col)s?\b",
+        instruction,
+        re.IGNORECASE,
+    )
+    if not col_match:
+        # Pattern: "drop nulls in <col1>, <col2>"
+        col_match = re.search(
+            r"\b(?:drop|remove)\s+(?:rows?\s+(?:with|having)\s+)?(?:null|missing|blank)s?\s+"
+            r"(?:in|from|for)\s+(?P<cols>.+?)\s*(?:column|field|$)",
+            instruction,
+            re.IGNORECASE,
+        )
+
+    if not col_match:
+        return None
+
+    cols_text = col_match.group("cols").strip()
+    # Split on "or", "and", ","
+    raw_cols = re.split(r"\s+(?:or|and)\s+|,\s*", cols_text)
+    raw_cols = [c.strip().lower().replace(" ", "_") for c in raw_cols if c.strip()]
+
+    if not raw_cols:
+        return None
+
+    # Try to resolve against source columns in the dataframe profile
+    source_columns = []
+    profile = canonical_intent.get("dataframe_profile")
+    if isinstance(profile, dict):
+        src = profile.get("source_columns") or profile.get("columns")
+        if isinstance(src, list):
+            source_columns = [str(c) for c in src]
+        elif isinstance(src, list) and src and isinstance(src[0], dict):
+            source_columns = [str(c.get("name", "")) for c in src if isinstance(c, dict)]
+
+    if not source_columns:
+        # Return raw extracted column names
+        return raw_cols if raw_cols else None
+
+    col_lower_map = {c.lower().replace(" ", "_"): c for c in source_columns}
+    resolved = []
+    for raw in raw_cols:
+        # Exact match
+        if raw in col_lower_map:
+            resolved.append(col_lower_map[raw])
+            continue
+        # Partial match
+        for key, real_name in col_lower_map.items():
+            if raw in key or key in raw:
+                resolved.append(real_name)
+                break
+
+    return resolved if resolved else None
+
+
 def _repair_null_row_cleanup(
     canonical_intent: dict[str, Any],
     *,
@@ -1966,10 +2189,12 @@ def _repair_null_row_cleanup(
         clean_action["operations"] = operations
 
     if not any(isinstance(op, dict) and str(op.get("name", "")).strip() == "drop_nulls" for op in operations):
+        # Try to extract specific columns for null checking from the instruction
+        null_columns = _extract_null_drop_columns(normalized_instruction, canonical_intent)
         operations.append(
             {
                 "name": "drop_nulls",
-                "parameters": {"columns": None, "how": "any"},
+                "parameters": {"columns": null_columns, "how": "any"},
             }
         )
         repaired = True

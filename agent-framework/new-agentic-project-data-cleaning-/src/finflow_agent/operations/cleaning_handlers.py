@@ -179,6 +179,73 @@ def apply_reorder_columns(df: pd.DataFrame, op: ReorderColumnsOperation) -> Dict
         df[c] = df_new[c]
     return {}
 
+
+def apply_absolute_value(df, op):
+    """Remove negative signs from numeric columns (convert to absolute values)."""
+    columns = getattr(op, "columns", None) or (op.parameters or {}).get("columns")
+    if columns == "__all_numeric_columns__" or columns is None:
+        numeric_cols = list(df.select_dtypes(include=["number"]).columns)
+        for col in numeric_cols:
+            df[col] = df[col].abs()
+        return {"columns_affected": numeric_cols}
+    if isinstance(columns, str):
+        columns = [columns]
+    for col in columns:
+        if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = df[col].abs()
+    return {"columns_affected": columns}
+
+
+def apply_normalize_categorical_values(df, op):
+    """Normalize inconsistent categorical values in text columns.
+
+    Standardizes values like Male/male/M → Male, Bachelor's/Bachelors/Bachelor → Bachelor's.
+    Uses title-case as the canonical form and groups abbreviations.
+    """
+    columns = getattr(op, "columns", None) or (op.parameters or {}).get("columns")
+    if columns == "__all_string_columns__" or columns is None:
+        columns = [col for col in df.columns if pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col])]
+    elif isinstance(columns, str):
+        columns = [columns]
+
+    affected = []
+    for col in columns:
+        if col not in df.columns:
+            continue
+        series = df[col].copy()
+        non_null = series.dropna()
+        if non_null.empty:
+            continue
+
+        # Get unique values and build normalization map
+        unique_vals = non_null.astype(str).str.strip().unique()
+        if len(unique_vals) > 50:
+            # Skip high-cardinality columns (not categorical)
+            continue
+
+        # Group by lowercase stripped form → pick the most common or title-case
+        norm_map = {}
+        for val in unique_vals:
+            canonical = val.strip().title()
+            # Handle common abbreviations
+            lower = val.lower().strip()
+            if lower in ("m", "male", "males"):
+                canonical = "Male"
+            elif lower in ("f", "female", "females"):
+                canonical = "Female"
+            elif lower in ("o", "other", "others"):
+                canonical = "Other"
+            elif lower.rstrip("'s") == lower.rstrip("s"):
+                # "Bachelors" / "Bachelor's" / "Bachelor" → Title case with 's
+                canonical = val.strip().title()
+            norm_map[val] = canonical
+
+        df[col] = series.map(lambda v: norm_map.get(str(v).strip(), v) if pd.notna(v) else v)
+        affected.append(col)
+
+    return {"columns_affected": affected}
+
+
 CLEANING_HANDLERS = {
     "trim_whitespace": apply_trim_whitespace,
     "normalize_column_names": apply_normalize_column_names,
@@ -196,7 +263,9 @@ CLEANING_HANDLERS = {
     "remove_empty_rows": apply_remove_empty_rows,
     "remove_empty_columns": apply_remove_empty_columns,
     "rename_columns": apply_rename_columns,
-    "reorder_columns": apply_reorder_columns
+    "reorder_columns": apply_reorder_columns,
+    "absolute_value": apply_absolute_value,
+    "normalize_categorical_values": apply_normalize_categorical_values,
 }
 
 

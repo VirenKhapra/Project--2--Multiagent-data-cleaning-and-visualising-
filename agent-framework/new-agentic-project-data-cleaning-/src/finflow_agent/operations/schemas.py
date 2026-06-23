@@ -89,6 +89,10 @@ class ReorderColumnsOperation(BaseOperation):
     type: Literal["reorder_columns"] = "reorder_columns"
     columns: List[str]
 
+class AbsoluteValueOperation(BaseOperation):
+    type: Literal["absolute_value"] = "absolute_value"
+    columns: Union[List[str], Literal["__all_numeric_columns__"]] = "__all_numeric_columns__"
+
 CleaningOperationType = Annotated[
     Union[
         TrimWhitespaceOperation,
@@ -108,6 +112,7 @@ CleaningOperationType = Annotated[
         RemoveEmptyColumnsOperation,
         RenameColumnsOperation,
         ReorderColumnsOperation,
+        AbsoluteValueOperation,
     ],
     Field(discriminator="type"),
 ]
@@ -168,7 +173,8 @@ class CalculationOperation(BaseModel):
     type: Literal["sum", "mean", "median", "min", "max", "count", "count_distinct", 
                   "variance", "standard_deviation", "group_sum", "group_mean", "group_count", 
                   "running_total", "percentage_change", "difference", "ratio", "absolute_value",
-                  "conditional_percentage", "quarterly_sum", "quarterly_mean", "quarterly_count"]
+                  "conditional_percentage", "quarterly_sum", "quarterly_mean", "quarterly_count",
+                  "cross_tab_sum", "cross_tab_mean", "cross_tab_count"]
     column: str
     output_column: Optional[str] = None
     group_by: Optional[List[str]] = None
