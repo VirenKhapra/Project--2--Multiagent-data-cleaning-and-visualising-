@@ -92,26 +92,33 @@ class VisualizationAgent:
             executor = VisualizationExecutor()
             visualization_specs: list[dict[str, Any]] = []
 
-            # Build an operation_result-like structure from the input DataFrame.
-            # Pass chart configs so aggregation metadata can be set on output fields.
-            operation_result = self._build_operation_result(input_data, charts=charts)
+            # Inject descriptions from params into chart configs
+            chart_descriptions = params.get("chart_descriptions", [])
 
-            for chart_config in charts:
+            for idx, chart_config in enumerate(charts):
+                # Inject description if available
+                if idx < len(chart_descriptions) and chart_descriptions[idx]:
+                    chart_config = dict(chart_config)  # Don't mutate original
+                    chart_config["description"] = chart_descriptions[idx]
+
                 chart_type = chart_config.get("type", "auto")
-                # Map "auto" or missing to let executor handle it
                 if not chart_type:
                     chart_type = "auto"
 
-                # Build encoding hints from chart config or auto-detect from fields
+                # Per-chart aggregation: compute group_count/sum for this chart's
+                # specific group_by column from the raw input dataframe
+                chart_operation_result = self._aggregate_for_chart(input_df, chart_config)
+
+                # Build encoding hints from chart config
                 encoding_hints = self._build_encoding_hints(
-                    chart_config, chart_type, operation_result
+                    chart_config, chart_type, chart_operation_result
                 )
 
                 source_result_id = str(uuid.uuid4())
                 operation_id = f"viz_{uuid.uuid4().hex[:8]}"
 
                 spec = executor.execute(
-                    operation_result=operation_result,
+                    operation_result=chart_operation_result,
                     chart_type=chart_type,
                     encoding_hints=encoding_hints,
                     source_result_id=source_result_id,
@@ -342,3 +349,117 @@ class VisualizationAgent:
             }
 
         return None
+
+    @staticmethod
+    def _aggregate_for_chart(df, chart_config: dict) -> dict[str, Any]:
+        """Independently aggregate the raw dataframe for a specific chart.
+
+        Each chart gets its own group_by aggregation so multiple charts
+        can use different grouping columns from the same source data.
+        """
+        import pandas as pd
+
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return {"fields": [], "rows": []}
+
+        group_by = chart_config.get("group_by")
+        measure = chart_config.get("measure")
+        aggregation = chart_config.get("aggregation", "count")
+        x_field = chart_config.get("x", "")
+        output_field = chart_config.get("output_field", "record_count")
+        description = chart_config.get("description", "")
+
+        # Determine the grouping column
+        group_col = None
+        if group_by and isinstance(group_by, list) and group_by:
+            group_col = group_by[0]
+        elif x_field and x_field in df.columns:
+            group_col = x_field
+
+        # If no explicit group_col, infer from chart description by matching
+        # description keywords against actual column names
+        if not group_col and description:
+            desc_lower = description.lower().replace("_", " ")
+            col_lower_map = {c.lower().replace("_", " "): c for c in df.columns}
+            # Try to find a column mentioned in the description
+            for col_key, col_real in col_lower_map.items():
+                if col_key in desc_lower or desc_lower in col_key:
+                    # Verify it's a categorical column
+                    if pd.api.types.is_string_dtype(df[col_real]) or pd.api.types.is_object_dtype(df[col_real]):
+                        group_col = col_real
+                        break
+            # Also try partial word matching
+            if not group_col:
+                desc_words = [w for w in desc_lower.split() if len(w) > 3]
+                for col_key, col_real in col_lower_map.items():
+                    if any(word in col_key for word in desc_words):
+                        if pd.api.types.is_string_dtype(df[col_real]) or pd.api.types.is_object_dtype(df[col_real]):
+                            group_col = col_real
+                            break
+
+        # Resolve column case-insensitively from x_field
+        if not group_col and x_field:
+            col_lower_map = {c.lower().replace(" ", "_"): c for c in df.columns}
+            resolved = col_lower_map.get(x_field.lower().replace(" ", "_"))
+            if resolved:
+                group_col = resolved
+            else:
+                for real_col in df.columns:
+                    if x_field.lower() in real_col.lower() or real_col.lower() in x_field.lower():
+                        group_col = real_col
+                        break
+
+        if not group_col or group_col not in df.columns:
+            # Fallback: use first categorical column
+            for col in df.columns:
+                if pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col]):
+                    if df[col].nunique() < len(df) * 0.5:
+                        group_col = col
+                        break
+            if not group_col:
+                group_col = df.columns[0]
+
+        # Perform aggregation
+        if aggregation == "sum" and measure and measure in df.columns:
+            grouped = df.groupby(group_col, as_index=False)[measure].sum()
+            grouped.rename(columns={measure: output_field}, inplace=True)
+        elif aggregation == "mean" and measure and measure in df.columns:
+            grouped = df.groupby(group_col, as_index=False)[measure].mean()
+            grouped.rename(columns={measure: output_field}, inplace=True)
+        else:
+            # Default: count
+            grouped = df.groupby(group_col, as_index=False).size()
+            grouped.rename(columns={"size": output_field}, inplace=True)
+
+        # Build operation_result format
+        fields = [
+            {
+                "id": str(group_col),
+                "label": str(group_col).replace("_", " ").title(),
+                "data_type": "string",
+                "role": "category",
+                "aggregation": None,
+            },
+            {
+                "id": str(output_field),
+                "label": str(output_field).replace("_", " ").title(),
+                "data_type": "number",
+                "role": "measure",
+                "aggregation": aggregation,
+            },
+        ]
+
+        rows = []
+        for _, row in grouped.iterrows():
+            clean_row = {}
+            for col in grouped.columns:
+                v = row[col]
+                if hasattr(v, "item"):
+                    clean_row[str(col)] = v.item()
+                elif pd.isna(v):
+                    clean_row[str(col)] = None
+                else:
+                    clean_row[str(col)] = v
+            rows.append(clean_row)
+
+        return {"fields": fields, "rows": rows}

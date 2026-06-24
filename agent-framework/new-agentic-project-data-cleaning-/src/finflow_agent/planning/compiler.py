@@ -477,10 +477,8 @@ def compile_intent_to_plan(
     #
     #    When the visualization plan contains charts that declare a
     #    ``group_by`` field, the compiler inserts a ``calculation_agent``
-    #    step (using group_count/group_sum/group_mean) BEFORE the
-    #    visualization step so the visualization agent receives
-    #    pre-aggregated data (zero-calculation principle).
-    #    Multi-chart: each chart gets its own calc step if needed.
+    #    The visualization agent handles per-chart aggregation internally,
+    #    so it receives the raw clean/filtered dataframe directly.
     # ------------------------------------------------------------------
     if intent.needs_visualization and intent.visualization_plan is not None:
         if not get_enable_visualization():
@@ -488,55 +486,19 @@ def compile_intent_to_plan(
                 VISUALIZATION_REQUESTED_BUT_DISABLED_MESSAGE
             )
 
-        # Skip all calc_viz steps if a calculate step already produced grouped data
-        has_prior_calc = any(s.step_id == "calculate" for s in steps)
-
-        # Build independent calc steps for each chart that needs aggregation
-        if not has_prior_calc:
-            for idx, chart in enumerate(intent.visualization_plan.charts):
-                if not chart.group_by:
-                    continue
-
-                # Determine operation type
-                if chart.aggregation == "sum":
-                    op_type = "group_sum" if len(chart.group_by) == 1 else "cross_tab_sum"
-                elif chart.aggregation == "mean":
-                    op_type = "group_mean" if len(chart.group_by) == 1 else "cross_tab_mean"
-                else:
-                    op_type = "group_count" if len(chart.group_by) == 1 else "cross_tab_count"
-
-                output_col = chart.output_field or "record_count"
-                measure_col = chart.measure or chart.group_by[0]
-
-                calc_step_id = f"calc_viz_{idx}" if idx > 0 else "calc_viz"
-                calc_output_key = f"df_calc_viz_{idx}" if idx > 0 else "df_calc_viz"
-
-                steps.append(
-                    PlanStep(
-                        step_id=calc_step_id,
-                        agent="calculation_agent",
-                        params={"operations": [{
-                            "type": op_type,
-                            "column": measure_col,
-                            "group_by": list(chart.group_by),
-                            "output_column": output_col,
-                        }]},
-                        depends_on=[steps[-1].step_id] if idx == 0 else [steps[-1].step_id],
-                        input_from=[last_df_key],
-                        output_key=calc_output_key,
-                    )
-                )
-            # Use last calc step output for visualization
-            if any(s.step_id.startswith("calc_viz") for s in steps):
-                last_df_key = next(
-                    s.output_key for s in reversed(steps) if s.step_id.startswith("calc_viz")
-                )
+        # Collect descriptions for per-chart column inference
+        chart_descriptions = [
+            chart.title or chart.x or "" for chart in intent.visualization_plan.charts
+        ]
 
         steps.append(
             PlanStep(
                 step_id="visualize",
                 agent="visualization_agent",
-                params={"plan": intent.visualization_plan.model_dump()},
+                params={
+                    "plan": intent.visualization_plan.model_dump(),
+                    "chart_descriptions": chart_descriptions,
+                },
                 depends_on=[steps[-1].step_id],
                 input_from=[last_df_key],
                 output_key="df_visualized",
@@ -790,13 +752,33 @@ def _canonical_intent_to_plan_intent(
             if not y_field:
                 y_field = viz_output_field or "record_count"
 
-            # Fallback x_field from source columns
+            # Fallback x_field from description or source columns
             if not x_field and source_columns:
-                for col in source_columns:
-                    col_lower = col.lower()
-                    if any(kw in col_lower for kw in ["gender", "category", "type", "status", "class", "department", "group", "education"]):
-                        x_field = col
-                        break
+                # Try to match chart description against column names
+                viz_description = viz_intent.get("description", "")
+                if viz_description:
+                    desc_lower = viz_description.lower().replace("_", " ")
+                    for col in source_columns:
+                        col_normalized = col.lower().replace("_", " ")
+                        if col_normalized in desc_lower or desc_lower in col_normalized:
+                            x_field = col
+                            break
+                    # Partial word match
+                    if not x_field:
+                        desc_words = [w for w in desc_lower.split() if len(w) > 3]
+                        for col in source_columns:
+                            col_lower = col.lower().replace("_", " ")
+                            if any(w in col_lower for w in desc_words):
+                                x_field = col
+                                break
+
+                # Generic fallback: first categorical keyword match
+                if not x_field:
+                    for col in source_columns:
+                        col_lower = col.lower()
+                        if any(kw in col_lower for kw in ["gender", "category", "type", "status", "class", "department", "group", "education"]):
+                            x_field = col
+                            break
                 if not x_field:
                     x_field = source_columns[0]
 
@@ -816,11 +798,12 @@ def _canonical_intent_to_plan_intent(
             effective_aggregation = agg_type if agg_type != "count" else (viz_aggregation or "count")
 
             try:
+                chart_title = viz_intent.get("description", f"{resolved_chart_type.capitalize()} Chart") or f"{resolved_chart_type.capitalize()} Chart"
                 charts_list.append(ChartSpec(
                     type=resolved_chart_type,
                     x=x_field,
                     y=y_field,
-                    title=f"{resolved_chart_type.capitalize()} Chart",
+                    title=chart_title,
                     group_by=effective_group_by,
                     measure=effective_measure,
                     aggregation=effective_aggregation,
