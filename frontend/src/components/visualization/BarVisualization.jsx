@@ -28,9 +28,9 @@ export default function BarVisualization({ spec }) {
   const yLabel = encoding.y_label || yField;
 
   // Theme colors aligned with FinFlow dark/glassmorphism
-  const axisColor = "var(--ff-muted, #93a6c7)";
+  const axisColor = "#ffffff";
   const gridColor = "var(--ff-border, rgba(122, 162, 255, 0.18))";
-  const barColor = "var(--ff-accent, #3b82f6)";
+  const barColor = "var(--ff-yellow-ey, #ffe600)";
   const tooltipBg = "var(--ff-panel-strong, #0f1f36)";
   const tooltipBorder = "var(--ff-border, rgba(122, 162, 255, 0.18))";
   const textColor = "var(--ff-text, #e7eefc)";
@@ -40,33 +40,35 @@ export default function BarVisualization({ spec }) {
       <ResponsiveContainer width="100%" height={options.height || 320}>
         <BarChart
           data={data}
-          margin={{ top: 16, right: 24, bottom: 32, left: 24 }}
+          margin={{ top: 16, right: 24, bottom: 54, left: 24 }}
         >
           <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
           <XAxis
             dataKey={xField}
-            tick={{ fill: axisColor, fontSize: 12 }}
+            tick={{ fill: axisColor, fontSize: 13 }}
             axisLine={{ stroke: gridColor }}
             tickLine={{ stroke: gridColor }}
             label={{
               value: xLabel,
               position: "insideBottom",
-              offset: -20,
-              fill: axisColor,
-              fontSize: 12,
+              offset: -12,
+              fill: "var(--ff-yellow-ey)",
+              fontSize: 15,
+              fontWeight: 600,
             }}
           />
           <YAxis
-            tick={{ fill: axisColor, fontSize: 12 }}
+            tick={{ fill: axisColor, fontSize: 13 }}
             axisLine={{ stroke: gridColor }}
             tickLine={{ stroke: gridColor }}
             label={{
               value: yLabel,
               angle: -90,
               position: "insideLeft",
-              offset: -10,
-              fill: axisColor,
-              fontSize: 12,
+              offset: -5,
+              fill: "var(--ff-yellow-ey)",
+              fontSize: 15,
+              fontWeight: 600,
             }}
           />
           <Tooltip
@@ -81,7 +83,10 @@ export default function BarVisualization({ spec }) {
             labelFormatter={(value) => `${xLabel}: ${value}`}
           />
           <Legend
-            wrapperStyle={{ color: textColor, fontSize: 12 }}
+            verticalAlign="bottom"
+            height={36}
+            iconSize={12}
+            wrapperStyle={{ color: textColor, fontSize: 13, paddingTop: 16 }}
           />
           <Bar
             dataKey={yField}

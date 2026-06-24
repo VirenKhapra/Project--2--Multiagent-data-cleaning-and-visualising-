@@ -12,18 +12,16 @@ import {
  * Default color palette for pie slices — FinFlow dark theme compatible.
  */
 const COLORS = [
-  "#6366f1", // indigo
-  "#8b5cf6", // violet
-  "#06b6d4", // cyan
-  "#10b981", // emerald
-  "#f59e0b", // amber
-  "#ef4444", // red
-  "#ec4899", // pink
-  "#14b8a6", // teal
-  "#f97316", // orange
-  "#84cc16", // lime
-  "#a855f7", // purple
-  "#22d3ee", // light cyan
+  "#ffe600", // EY Yellow
+  "#00b4d8", // Teal Blue
+  "#f26419", // Amber Orange
+  "#06d6a0", // Mint
+  "#8338ec", // Indigo Purple
+  "#e76f51", // Coral Rose
+  "#2a9d8f", // Slate Green
+  "#457b9d", // Steel Blue
+  "#ffd166", // Warm Gold
+  "#ff006e", // Rose
 ];
 
 /**
@@ -63,11 +61,27 @@ export default function PieVisualization({ spec }) {
             nameKey={categoryKey}
             cx="50%"
             cy="50%"
-            outerRadius={120}
-            label={({ name, percent }) =>
-              `${name} (${(percent * 100).toFixed(1)}%)`
-            }
-            labelLine
+            outerRadius={110}
+            label={({ cx, cy, midAngle, innerRadius, outerRadius, percent, name }) => {
+              const RADIAN = Math.PI / 180;
+              const radius = outerRadius + 24;
+              const x = cx + radius * Math.cos(-midAngle * RADIAN);
+              const y = cy + radius * Math.sin(-midAngle * RADIAN);
+              return (
+                <text
+                  x={x}
+                  y={y}
+                  fill="#ffffff"
+                  textAnchor={x > cx ? "start" : "end"}
+                  dominantBaseline="central"
+                  fontSize={13}
+                  fontWeight={500}
+                >
+                  {`${name} (${(percent * 100).toFixed(1)}%)`}
+                </text>
+              );
+            }}
+            labelLine={{ stroke: "rgba(255, 255, 255, 0.4)" }}
           >
             {data.map((entry, index) => (
               <Cell
@@ -81,14 +95,14 @@ export default function PieVisualization({ spec }) {
             formatter={(value) => [value, valueLabel]}
             labelFormatter={(label) => `${categoryLabel}: ${label}`}
             contentStyle={{
-              backgroundColor: "rgba(15, 23, 42, 0.9)",
-              border: "1px solid rgba(99, 102, 241, 0.3)",
+              backgroundColor: "var(--ff-panel-strong, #0f1f36)",
+              border: "1px solid var(--ff-border, rgba(122, 162, 255, 0.18))",
               borderRadius: "8px",
-              color: "#e2e8f0",
+              color: "var(--ff-text, #e7eefc)",
             }}
           />
           <Legend
-            wrapperStyle={{ color: "#e2e8f0" }}
+            wrapperStyle={{ color: "var(--ff-text, #e7eefc)", fontSize: 13 }}
           />
         </PieChart>
       </ResponsiveContainer>

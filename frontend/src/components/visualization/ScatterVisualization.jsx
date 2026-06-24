@@ -38,36 +38,41 @@ export default function ScatterVisualization({ spec }) {
   return (
     <div className="ff-viz-chart ff-viz-chart--scatter">
       <ResponsiveContainer width="100%" height={360}>
-        <ScatterChart margin={{ top: 20, right: 30, bottom: 20, left: 20 }}>
+        <ScatterChart margin={{ top: 20, right: 30, bottom: 44, left: 20 }}>
           <CartesianGrid
             strokeDasharray="3 3"
-            stroke="rgba(148, 163, 184, 0.15)"
+            stroke="var(--ff-border, rgba(122, 162, 255, 0.18))"
             className="ff-viz-chart__grid"
           />
           <XAxis
             dataKey={xKey}
             name={xLabel}
             type="number"
-            tick={{ fill: "#94a3b8", fontSize: 12 }}
-            axisLine={{ stroke: "rgba(148, 163, 184, 0.3)" }}
+            tick={{ fill: "#ffffff", fontSize: 13 }}
+            axisLine={{ stroke: "var(--ff-border, rgba(122, 162, 255, 0.18))" }}
             label={{
               value: xLabel,
-              position: "bottom",
-              offset: 0,
-              fill: "#94a3b8",
+              position: "insideBottom",
+              offset: -12,
+              fill: "var(--ff-yellow-ey)",
+              fontSize: 15,
+              fontWeight: 600,
             }}
           />
           <YAxis
             dataKey={yKey}
             name={yLabel}
             type="number"
-            tick={{ fill: "#94a3b8", fontSize: 12 }}
-            axisLine={{ stroke: "rgba(148, 163, 184, 0.3)" }}
+            tick={{ fill: "#ffffff", fontSize: 13 }}
+            axisLine={{ stroke: "var(--ff-border, rgba(122, 162, 255, 0.18))" }}
             label={{
               value: yLabel,
               angle: -90,
               position: "insideLeft",
-              fill: "#94a3b8",
+              offset: -5,
+              fill: "var(--ff-yellow-ey)",
+              fontSize: 15,
+              fontWeight: 600,
             }}
           />
           <Tooltip
@@ -77,15 +82,15 @@ export default function ScatterVisualization({ spec }) {
               return [value, label];
             }}
             contentStyle={{
-              backgroundColor: "rgba(15, 23, 42, 0.9)",
-              border: "1px solid rgba(99, 102, 241, 0.3)",
+              backgroundColor: "var(--ff-panel-strong, #0f1f36)",
+              border: "1px solid var(--ff-border, rgba(122, 162, 255, 0.18))",
               borderRadius: "8px",
-              color: "#e2e8f0",
+              color: "var(--ff-text, #e7eefc)",
             }}
           />
           <Scatter
             data={data}
-            fill="#6366f1"
+            fill="var(--ff-yellow-ey, #ffe600)"
             fillOpacity={0.7}
             className="ff-viz-chart__scatter-dots"
           />

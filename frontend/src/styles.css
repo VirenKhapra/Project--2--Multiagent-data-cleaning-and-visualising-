@@ -5057,7 +5057,7 @@ body {
   --ff-raised-ey: #2a2a38;
   --ff-yellow-ey: #ffe600;
   --ff-white-ey: #ffffff;
-  --ff-secondary-ey: #8080a0;
+  --ff-secondary-ey: #ffffff;
   --ff-muted-ey: #50505f;
   --ff-border-ey: #2d2d3a;
   --ff-ease-ey: cubic-bezier(0.4, 0, 0.2, 1);
@@ -5116,9 +5116,16 @@ body {
 .ff-sidebar__meta span,
 .ff-hero-card__header span {
   color: var(--ff-yellow-ey);
-  font-size: 10px;
+  font-size: 15px;
   font-weight: 500;
   letter-spacing: 0.1em;
+}
+
+.auth-page-hero .ff-eyebrow {
+  background: linear-gradient(90deg, #ffe600 0%, rgba(255, 230, 0, 0.2) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  width: fit-content;
 }
 
 .ff-topbar h1,
@@ -5905,7 +5912,6 @@ select.auth-page-form__input option {
 }
 
 .ff-dashboard-page .ff-copy-muted,
-.ff-dashboard-page .ff-panel__head .ff-eyebrow,
 .ff-dashboard-page .ff-stat-card span,
 .ff-dashboard-page .ff-stat-card small,
 .ff-dashboard-page .ff-key-metrics span,
@@ -6099,7 +6105,6 @@ select.auth-page-form__input option {
 }
 
 .ff-dashboard-page .ff-copy-muted,
-.ff-dashboard-page .ff-panel__head .ff-eyebrow,
 .ff-dashboard-page .ff-stat-card span,
 .ff-dashboard-page .ff-stat-card small,
 .ff-dashboard-page .ff-key-metrics span,
