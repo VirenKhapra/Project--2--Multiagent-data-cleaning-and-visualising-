@@ -36,6 +36,7 @@ class VisualizationAgentParams(BaseModel):
     """Pydantic param model for the visualization agent."""
 
     plan: VisualizationOperationPlan
+    chart_descriptions: list[str] = []
 
 
 @registry.register
@@ -354,70 +355,80 @@ class VisualizationAgent:
     def _aggregate_for_chart(df, chart_config: dict) -> dict[str, Any]:
         """Independently aggregate the raw dataframe for a specific chart.
 
-        Each chart gets its own group_by aggregation so multiple charts
-        can use different grouping columns from the same source data.
+        Uses grounded resolved_column from fields when available.
+        Falls back to description-based matching against actual columns.
+        Never defaults to an arbitrary column — returns empty result if
+        the field cannot be resolved.
         """
         import pandas as pd
+        from finflow_agent.planning.intent_enricher import normalize_identifier
 
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
             return {"fields": [], "rows": []}
 
-        group_by = chart_config.get("group_by")
         measure = chart_config.get("measure")
         aggregation = chart_config.get("aggregation", "count")
-        x_field = chart_config.get("x", "")
         output_field = chart_config.get("output_field", "record_count")
         description = chart_config.get("description", "")
 
-        # Determine the grouping column
+        # Priority 1: Use grounded resolved_column from fields
         group_col = None
-        if group_by and isinstance(group_by, list) and group_by:
-            group_col = group_by[0]
-        elif x_field and x_field in df.columns:
-            group_col = x_field
-
-        # If no explicit group_col, infer from chart description by matching
-        # description keywords against actual column names
-        if not group_col and description:
-            desc_lower = description.lower().replace("_", " ")
-            col_lower_map = {c.lower().replace("_", " "): c for c in df.columns}
-            # Try to find a column mentioned in the description
-            for col_key, col_real in col_lower_map.items():
-                if col_key in desc_lower or desc_lower in col_key:
-                    # Verify it's a categorical column
-                    if pd.api.types.is_string_dtype(df[col_real]) or pd.api.types.is_object_dtype(df[col_real]):
-                        group_col = col_real
+        fields_list = chart_config.get("fields", [])
+        if isinstance(fields_list, list):
+            for field in fields_list:
+                if isinstance(field, dict) and field.get("resolved_column"):
+                    candidate = field["resolved_column"]
+                    if candidate in df.columns:
+                        group_col = candidate
                         break
-            # Also try partial word matching
-            if not group_col:
-                desc_words = [w for w in desc_lower.split() if len(w) > 3]
-                for col_key, col_real in col_lower_map.items():
-                    if any(word in col_key for word in desc_words):
+                    # Try case-insensitive
+                    col_lower_map = {c.lower(): c for c in df.columns}
+                    if candidate.lower() in col_lower_map:
+                        group_col = col_lower_map[candidate.lower()]
+                        break
+
+        # Priority 2: Description-based matching against actual dataframe columns
+        if not group_col and description:
+            desc_norm = normalize_identifier(description)
+            col_norm_map = {normalize_identifier(c): c for c in df.columns}
+
+            # Exact normalized match
+            if desc_norm in col_norm_map:
+                group_col = col_norm_map[desc_norm]
+            else:
+                # Substring/overlap match
+                for col_norm, col_real in col_norm_map.items():
+                    if col_norm in desc_norm or desc_norm in col_norm:
                         if pd.api.types.is_string_dtype(df[col_real]) or pd.api.types.is_object_dtype(df[col_real]):
                             group_col = col_real
                             break
+                if not group_col:
+                    desc_parts = [p for p in desc_norm.split("_") if len(p) > 2]
+                    for col_norm, col_real in col_norm_map.items():
+                        col_parts = col_norm.split("_")
+                        if any(dp in col_parts for dp in desc_parts):
+                            if pd.api.types.is_string_dtype(df[col_real]) or pd.api.types.is_object_dtype(df[col_real]):
+                                group_col = col_real
+                                break
 
-        # Resolve column case-insensitively from x_field
-        if not group_col and x_field:
-            col_lower_map = {c.lower().replace(" ", "_"): c for c in df.columns}
-            resolved = col_lower_map.get(x_field.lower().replace(" ", "_"))
-            if resolved:
-                group_col = resolved
-            else:
-                for real_col in df.columns:
-                    if x_field.lower() in real_col.lower() or real_col.lower() in x_field.lower():
-                        group_col = real_col
-                        break
+        # Priority 3: Explicit x_field from chart config
+        if not group_col:
+            x_field = chart_config.get("x", "")
+            if x_field and x_field in df.columns:
+                group_col = x_field
+            elif x_field:
+                col_norm_map = {normalize_identifier(c): c for c in df.columns}
+                x_norm = normalize_identifier(x_field)
+                if x_norm in col_norm_map:
+                    group_col = col_norm_map[x_norm]
 
+        # NO FALLBACK — do not default to gender or first categorical column
         if not group_col or group_col not in df.columns:
-            # Fallback: use first categorical column
-            for col in df.columns:
-                if pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col]):
-                    if df[col].nunique() < len(df) * 0.5:
-                        group_col = col
-                        break
-            if not group_col:
-                group_col = df.columns[0]
+            return {
+                "fields": [],
+                "rows": [],
+                "error": f"Could not resolve visualization field from description: {description!r}. Available columns: {list(df.columns)[:10]}",
+            }
 
         # Perform aggregation
         if aggregation == "sum" and measure and measure in df.columns:

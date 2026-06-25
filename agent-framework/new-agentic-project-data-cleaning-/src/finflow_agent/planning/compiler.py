@@ -664,12 +664,23 @@ def _canonical_intent_to_plan_intent(
         if isinstance(action, VisualizeIntent):
             needs_visualization = True
             # Collect all visualization intents for multi-chart support
+            grounded_fields = [
+                {"resolved_column": f.resolved_column, "raw_reference": f.raw_reference}
+                for f in (action.fields or [])
+                if f.resolved_column
+            ]
+            # Use first field's raw_reference as description if available
+            desc = ""
+            if action.fields:
+                desc = action.fields[0].raw_reference or ""
             visualize_intents.append({
                 "chart_type": action.chart_type,
                 "group_by": action.group_by,
                 "aggregation": action.aggregation,
                 "measure": action.measure,
                 "output_field": action.output_field,
+                "fields": grounded_fields,
+                "description": desc,
             })
             # Keep last one as fallback for single-chart variables
             visualize_chart_type = action.chart_type
@@ -731,7 +742,15 @@ def _canonical_intent_to_plan_intent(
             y_field = ""
             agg_type = viz_aggregation or "count"
 
-            if viz_group_by and isinstance(viz_group_by, list) and viz_group_by:
+            # Priority 0: Use grounded resolved_column from fields (the contract)
+            viz_fields = viz_intent.get("fields", [])
+            if isinstance(viz_fields, list):
+                for field in viz_fields:
+                    if isinstance(field, dict) and field.get("resolved_column"):
+                        x_field = field["resolved_column"]
+                        break
+
+            if not x_field and viz_group_by and isinstance(viz_group_by, list) and viz_group_by:
                 x_field = viz_group_by[0]
             if viz_measure:
                 y_field = viz_measure

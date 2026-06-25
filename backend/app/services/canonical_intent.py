@@ -1623,7 +1623,8 @@ _RETURN_ROWS_PATTERNS = (
     r"\breturn\s+(?:me\s+)?(?:the\s+)?data\b",
     r"\breturn\s+(?:me\s+)?(?:the\s+)?records\b",
     r"\bshow\s+(?:it\s+)?as\s+a\s+(?:bar|pie|line|scatter)\s*(?:chart|graph)?\b",
-    r"\b(?:bar|pie|line|scatter)\s+chart\b",
+    r"\b(?:bar|pie|pi|line|scatter)\s+(?:chart|graph)\b",
+    r"\b(?:generate|create)\s+(?:a\s+|the\s+)?(?:bar|pie|pi|line|scatter)\s+(?:chart|graph)\b",
     r"\bvisuali[sz]e\b",
 )
 
