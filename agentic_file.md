@@ -12,7 +12,7 @@ FinFlow is an AI-powered data processing platform. Users upload files (CSV, Exce
 - Data cleaning (trim, normalize, deduplicate, handle nulls, remove negatives)
 - Row filtering with aggregate comparisons (e.g., "rows where amount > average")
 - Calculations (sum, mean, group_by, percentage, quarterly aggregation, cross-tabulation)
-- Multi-chart visualization (pie, bar, line, scatter)
+- Multi-chart visualization (pie, bar, line, s catter)
 - PDF table extraction
 - Multi-step natural language processing
 
